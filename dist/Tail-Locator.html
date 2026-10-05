@@ -257,7 +257,7 @@
       <details class="allchecks" id="simpleHelp">
         <summary>Use this result on your own website or in Python</summary>
         <div class="inner">
-          <p class="note" style="margin:10px 0 8px">While <span class="mono">tail_locator.py</span> is running it answers <span class="mono">http://127.0.0.1:8765/locate?reg=EI-DEI</span> with JSON. The <span class="mono">text</span> field is exactly the line above and <span class="mono">verified</span> is true or false. Drop this into your page to fill a text box:</p>
+          <p class="note" style="margin:10px 0 8px">The server behind this page answers <span class="mono" id="locateUrl">/locate?reg=EI-DEI</span> with JSON. The <span class="mono">text</span> field is exactly the line above and <span class="mono">verified</span> is true or false. Drop this into your page to fill a text box:</p>
           <pre class="code" id="siteSnippet"></pre>
           <p class="note" style="margin-top:8px">Python, same folder: <span class="mono">import tail_locator; tail_locator.locate("EI-DEI")</span> returns the same JSON; <span class="mono">locate_text()</span> just the line. Terminal: <span class="mono">python tail_locator.py locate EI-DEI</span>. Add <span class="mono">&amp;format=text</span> to the URL for the bare line. Opened from your site as a popup or iframe with <span class="mono">#simple=EI-DEI</span>, this page posts the result back with <span class="mono">postMessage</span>.</p>
         </div>
@@ -1148,7 +1148,7 @@ const SITE_SNIPPET = `<!-- on your page -->
 <input id="acLocation" placeholder="Aircraft location">
 <script>
 async function fillAircraftLocation(reg) {
-  const r = await fetch('http://127.0.0.1:8765/locate?reg=' + encodeURIComponent(reg));
+  const r = await fetch('__BASE__/locate?reg=' + encodeURIComponent(reg));
   const j = await r.json();            // j.text = "SNN - Shannon Airport - Ireland"
   document.getElementById('acLocation').value = j.text;   // or "Currently en route to ... from ..."
 }
@@ -1330,7 +1330,8 @@ async function init() {
   $('recent').addEventListener('click', (e) => { const b = e.target.closest('[data-reg]'); if (b) { input.value = b.dataset.reg; locate(b.dataset.reg); } });
   $('tabSimple').addEventListener('click', () => setView('simple')); $('tabFull').addEventListener('click', () => setView('full')); $('tabDev').addEventListener('click', () => setView('dev')); $('tabSettings').addEventListener('click', () => setView('settings'));
   $('simple').addEventListener('click', (e) => { const b = e.target.closest('[data-copy]'); if (b) { const inp = $('line-' + b.dataset.copy); copyText(inp ? inp.value : '', b); return; } const inp = e.target.closest('input.line'); if (inp) inp.select(); });
-  $('siteSnippet').textContent = SITE_SNIPPET.replace('<\\/script>', '<\/script>');
+  const lu = $('locateUrl'); if (lu) lu.textContent = (/^https?:$/.test(location.protocol) ? location.origin : 'http://127.0.0.1:8765') + '/locate?reg=EI-DEI';
+  $('siteSnippet').textContent = SITE_SNIPPET.replace('<\\/script>', '<\/script>').replace('__BASE__', /^https?:$/.test(location.protocol) ? location.origin : 'http://127.0.0.1:8765');
   let h = decodeURIComponent((location.hash || '').slice(1)); let forced = '';
   if (/^simple=/i.test(h)) { forced = 'simple'; h = h.replace(/^simple=/i, ''); } else if (/^full=/i.test(h)) { forced = 'full'; h = h.replace(/^full=/i, ''); }
   setView(forced || LS.get('view', 'simple'));

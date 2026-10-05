@@ -684,7 +684,8 @@ def main():
     ap = argparse.ArgumentParser(description="Tail Locator — local launcher and lookup engine")
     ap.add_argument("command", nargs="?", default="serve", help="serve (default) | locate REG [REG ...]")
     ap.add_argument("regs", nargs="*")
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8765")))
+    ap.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"), help="bind address; 0.0.0.0 when hosted (Render sets PORT)")
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--days", type=int, default=7, help="history look-back for parked aircraft (1-14)")
     ap.add_argument("--json", action="store_true", help="with locate: print full JSON instead of the text line")
@@ -698,18 +699,19 @@ def main():
             print(json.dumps(res, ensure_ascii=False, indent=2) if args.json else res["text"])
         return
     Handler.days = max(1, min(14, args.days))
-    port = pick_port(args.port)
+    hosted = args.host != "127.0.0.1" or "PORT" in os.environ
+    port = args.port if hosted else pick_port(args.port)
     url = "http://127.0.0.1:%d/" % port
     if not os.path.exists(HTML_FILE):
         print("WARNING: Tail-Locator.html not found next to this script (%s)." % HERE)
     _load_data()
-    srv = Server(("127.0.0.1", port), Handler)
+    srv = Server((args.host, port), Handler)
     print("Tail Locator")
     print("  page:    %s" % url)
     print("  locate:  %slocate?reg=EI-DEI   (JSON; add &format=text for the bare line)" % url)
     print("  relay:   %srelay?url=...   allowed: %s" % (url, ", ".join(sorted(ALLOW))))
     print("  airports: %d loaded   stop: Ctrl+C" % len(airports()))
-    if not args.no_browser:
+    if not args.no_browser and not hosted:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         srv.serve_forever()
