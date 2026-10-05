@@ -1,0 +1,201 @@
+
+<header class="top">
+  <div class="logo">TL</div>
+  <div>
+    <h1>Tail Locator</h1>
+    <div class="sub">Aircraft location by registration — surveillance data, verified before use</div>
+  </div>
+  <div class="right">
+    <span class="dots" aria-label="Data sources">
+      <span class="dot off" id="dotRelay">No relay</span>
+      <span class="dot on" id="dotStatic">Registry</span>
+      <span class="dot off" id="dotFr24">FR24 off</span>
+    </span>
+    <span class="utc"><span id="utcClock">--:--:--</span>Z</span>
+    <span class="ver">v2.3</span>
+  </div>
+</header>
+
+<nav class="tabs" role="tablist" aria-label="Sections">
+  <button type="button" role="tab" id="tabSimple" aria-selected="true">Lookup</button>
+  <button type="button" role="tab" id="tabFull" aria-selected="false">Full detail</button>
+  <button type="button" role="tab" id="tabDev" aria-selected="false">Developer</button>
+  <button type="button" role="tab" id="tabSettings" aria-selected="false">Settings</button>
+</nav>
+
+<main>
+
+  <!-- STEP 1 : REGISTRATION (shown on Lookup and Full detail) -->
+  <section class="card v v-simple v-full" id="searchCard">
+    <div class="card-h"><span class="step-n">1</span> Enter aircraft registration</div>
+    <div class="card-b">
+      <div class="search">
+        <div class="field">
+          <label class="sr" for="regInput">Aircraft registration</label>
+          <input id="regInput" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="e.g. EI-DEI   (several: EI-DEI, G-XWBA, N789AN)">
+          <label class="auto" title="Run the lookup about a second after you stop typing"><input type="checkbox" id="autoRun" checked> auto</label>
+        </div>
+        <button class="btn primary" id="goBtn" type="button">Locate</button>
+      </div>
+      <div class="hint">
+        <span id="hintText">Up to 15 registrations per lookup. Press Enter or wait for auto-locate.</span>
+        <span class="recent" id="recent" aria-label="Recent lookups"></span>
+      </div>
+    </div>
+    <div class="progress" id="progress" role="status" aria-live="polite"><span class="spinner" aria-hidden="true"></span><span id="progressText">Working…</span></div>
+  </section>
+
+  <!-- STEP 2 : RESULT (Lookup) -->
+  <section class="card v v-simple" id="simpleCard">
+    <div class="card-h"><span class="step-n">2</span> Location <span class="r">format: CODE - Airport - Country</span></div>
+    <div class="card-b">
+      <div id="simple" aria-live="polite"><p class="note">The verified location line appears here. Nothing is shown until every verification check has passed; otherwise the line reads UNVERIFIED with the reason.</p></div>
+      <details class="allchecks" id="simpleHelp">
+        <summary>Use this result on your own website or in Python</summary>
+        <div class="inner">
+          <p class="note" style="margin:10px 0 8px">While <span class="mono">tail_locator.py</span> is running it answers <span class="mono">http://127.0.0.1:8765/locate?reg=EI-DEI</span> with JSON. The <span class="mono">text</span> field is exactly the line above and <span class="mono">verified</span> is true or false. Drop this into your page to fill a text box:</p>
+          <pre class="code" id="siteSnippet"></pre>
+          <p class="note" style="margin-top:8px">Python, same folder: <span class="mono">import tail_locator; tail_locator.locate("EI-DEI")</span> returns the same JSON; <span class="mono">locate_text()</span> just the line. Terminal: <span class="mono">python tail_locator.py locate EI-DEI</span>. Add <span class="mono">&amp;format=text</span> to the URL for the bare line. Opened from your site as a popup or iframe with <span class="mono">#simple=EI-DEI</span>, this page posts the result back with <span class="mono">postMessage</span>.</p>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <!-- FULL DETAIL -->
+  <section class="v v-full" id="results" aria-live="polite"></section>
+
+  <!-- DEVELOPER -->
+  <section class="card v v-dev dev">
+    <div class="card-h">Developer notes — where the data comes from and how a result is verified</div>
+    <div class="card-b">
+      <h3 class="sec">Pipeline</h3>
+      <div class="flow">
+        <div><b>1 · Identity</b>Registration → Mode S hex, type, operator (adsbdb.com, fallback hexdb.io).</div>
+        <div><b>2 · Live position</b>adsb.lol, airplanes.live, adsb.fi by registration and by hex; OpenSky by hex. All queried, every time.</div>
+        <div><b>3 · History</b>adsb.lol per-aircraft trace: today's rolling file, then the daily archive back up to 14 days.</div>
+        <div><b>4 · Airport match</b>Freshest fix → nearest airport from the embedded OurAirports database, runway-derived boundary.</div>
+        <div><b>5 · Verification</b>Seven checks on the ground, seven in flight. All must pass or the line is withheld.</div>
+        <div><b>6 · Output</b><span class="mono">CODE - Airport - Country</span>, or <span class="mono">Currently en route to … from …</span>, or <span class="mono">UNVERIFIED - manual check required - reason</span>.</div>
+      </div>
+
+      <h3 class="sec">Data sources</h3>
+      <div class="scroll"><table>
+        <thead><tr><th>Source</th><th>Endpoint</th><th>Provides</th><th>Used for</th><th>Access / terms</th></tr></thead>
+        <tbody>
+          <tr><td>adsbdb.com</td><td class="mono">api.adsbdb.com/v0/aircraft/{reg}<br>api.adsbdb.com/v0/callsign/{callsign}</td><td>Mode S hex, ICAO type, operator, registration; usual origin/destination for an airline callsign</td><td>Identity (step 1); "usual route" for an in-flight destination</td><td>Free, no key, direct from the browser</td></tr>
+          <tr><td>hexdb.io</td><td class="mono">hexdb.io/reg-hex?reg={reg}<br>hexdb.io/api/v1/aircraft/{hex}<br>hexdb.io/api/v1/route/icao/{callsign}</td><td>Registration ↔ hex, aircraft details, callsign route</td><td>Fallback identity and route</td><td>Free, no key, direct</td></tr>
+          <tr><td>VRS standing data (via adsb.lol)</td><td class="mono">vrs-standing-data.adsb.lol/routes/{XX}/{callsign}.json</td><td>Callsign route with airport ICAO/IATA</td><td>Last-resort route lookup</td><td>CC0, direct</td></tr>
+          <tr><td>adsb.lol</td><td class="mono">api.adsb.lol/v2/reg/{regs}<br>api.adsb.lol/v2/hex/{hexes}</td><td>Live position, altitude (baro, "ground" flag), ground speed, track, vertical rate, squawk, callsign, age of fix (seen_pos)</td><td>Live fix (step 2)</td><td>Free, no key, through the relay (refuses browser CORS). Community network, ODbL, personal/non-commercial use</td></tr>
+          <tr><td>adsb.lol traces</td><td class="mono">globe.adsb.lol/data/traces/{hh}/trace_full_{hex}.json<br>globe.adsb.lol/globe_history/YYYY/MM/DD/traces/{hh}/trace_full_{hex}.json</td><td>Every recorded position for the airframe for the day: time, lat/lon, altitude or "ground", speed, track, leg flags, callsign</td><td>Last known position when the transponder is off; leg reconstruction (departure, landing, dwell); corroboration</td><td>Free, through the relay. {hh} = last two characters of the hex</td></tr>
+          <tr><td>airplanes.live</td><td class="mono">api.airplanes.live/v2/reg/{regs}<br>api.airplanes.live/v2/hex/{hexes}</td><td>Same fields as adsb.lol (readsb format)</td><td>Independent live fix for corroboration</td><td>Free, through the relay, 1 request/second, non-commercial</td></tr>
+          <tr><td>adsb.fi</td><td class="mono">opendata.adsb.fi/api/v2/registration/{regs}<br>opendata.adsb.fi/api/v2/hex/{hexes}</td><td>Same fields (readsb format)</td><td>Independent live fix for corroboration</td><td>Free, through the relay, 1 request/second, personal non-commercial</td></tr>
+          <tr><td>OpenSky Network</td><td class="mono">opensky-network.org/api/states/all?icao24={hex}</td><td>State vector: position, baro altitude (m), on-ground flag, velocity (m/s), track, vertical rate, squawk, callsign, position source</td><td>Independent live fix; units converted to ft / kt / fpm</td><td>Anonymous access, ~400 credits per day, through the relay. CC BY-SA research licence</td></tr>
+          <tr><td>OurAirports</td><td class="mono">embedded (airports.json / window.AIRPORTS)</td><td>9,765 airports: ICAO, IATA, position, name, city, country, size, field elevation, boundary radius computed from runway-end coordinates (+1.5 km, floor 1.5–3.5 km by size)</td><td>Nearest-airport match; "inside boundary" test; IATA code and country name for the output line</td><td>Public domain. Large and medium airports, plus small ones with an IATA code or scheduled service; heliports and closed fields excluded</td></tr>
+          <tr><td>planespotters.net</td><td class="mono">api.planespotters.net/pub/photos/reg/{reg}</td><td>Photo thumbnail with photographer credit</td><td>Full detail tab only</td><td>Free, direct, credit required</td></tr>
+          <tr><td>Flightradar24 API (optional)</td><td class="mono">fr24api.flightradar24.com/api/live/flight-positions/full<br>…/api/flight-summary/full</td><td>Live position with filed origin/destination and ETA; flight history with recorded actual arrival airport</td><td>Only when a subscriber key is entered; filed route and landing record then join the verification</td><td>Paid (Explorer $9/month, 30,000 credits). Not used by default</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3 class="sec">How the fix is chosen</h3>
+      <ol>
+        <li>Every live source is queried; each returns at most one fix per aircraft with its own age. The freshest fix wins; the others are kept for the "Sources agree" check.</li>
+        <li>If no live fix is fresher than 15 minutes, or the aircraft is airborne, the adsb.lol trace is read. Its last point becomes the fix if it is newer than anything live. The trace walk starts with today's rolling file and steps back one archive day at a time until a file exists (look-back setting, default 7 days, max 14).</li>
+        <li>On-ground means the transponder's ground flag, or altitude within 1,500 ft of field elevation at ≤ 60 kt with no significant vertical rate. Anything else is airborne.</li>
+        <li>On the ground, the airport is the nearest one whose boundary contains the fix. When two boundaries overlap, the larger airport is preferred (a GA field inside a major's footprint does not win).</li>
+        <li>In flight, the destination is the filed one (FR24, if used) or the callsign's usual route; the departure is where the current leg's last ground point was in the trace. The schedule is never used to place the aircraft.</li>
+        <li>Diversions: only FR24's flight record (<span class="mono">dest_iata_actual</span> differing from <span class="mono">dest_iata</span>) is treated as a confirmed diversion. A landing somewhere other than a community route database's usual destination is noted as information only — usual routes are not filed plans. On the ground the output is always where the aircraft physically is, so a diversion never changes the line.</li>
+      </ol>
+
+      <h3 class="sec">Verification checks — the line is produced only if every one passes</h3>
+      <div class="scroll"><table>
+        <thead><tr><th>Check</th><th>Applies</th><th>Passes when</th><th>Catches</th></tr></thead>
+        <tbody>
+          <tr><td>Identity</td><td>Always</td><td>Every source that names a registration names the one requested; all sources agree on a single Mode S hex; at least one source confirms it</td><td>Re-registered airframes, registry errors, hex typos</td></tr>
+          <tr><td>Fix valid</td><td>Always</td><td>Coordinates in range and not 0,0; timestamp not in the future; within the look-back window</td><td>Corrupt or default positions, clock problems</td></tr>
+          <tr><td>Sources agree</td><td>Always</td><td>Any two fresh live fixes lie within 5 km (ground) or 60 km (airborne) of each other</td><td>MLAT scatter, mis-keyed hexes, a source serving a different aircraft</td></tr>
+          <tr><td>Inside airport boundary</td><td>Ground</td><td>Fix is within the chosen airport's runway-derived boundary and not also inside another airport of equal or larger size</td><td>Off-airport positions, ambiguous co-located fields</td></tr>
+          <tr><td>On-ground state</td><td>Ground</td><td>Ground flag set, or altitude within 1,500 ft of field elevation at ≤ 60 kt</td><td>Low overflights and go-arounds mistaken for landings</td></tr>
+          <tr><td>Corroborated</td><td>Ground</td><td>At least one of: two independent live sources agree on the ground; the trace ends with ≥ 3 ground positions at this airport spanning ≥ 2 minutes and no later movement; FR24 recorded the landing here</td><td>A single isolated fix, a bad MLAT point, a position that was never confirmed</td></tr>
+          <tr><td>Recent enough</td><td>Ground</td><td>Fix under 3 days old</td><td>Stale data presented as current</td></tr>
+          <tr><td>Fresh in-flight fix</td><td>Air</td><td>Fix under 15 minutes old</td><td>Tracks lost over water or outside coverage</td></tr>
+          <tr><td>Destination known</td><td>Air</td><td>A destination exists from FR24 or the route databases</td><td>Non-airline callsigns, ferry and test flights</td></tr>
+          <tr><td>Departure observed</td><td>Air</td><td>The departure airport comes from the trace (or FR24), not only from a route database</td><td>Routes assumed rather than seen</td></tr>
+          <tr><td>Route consistent</td><td>Air</td><td>The route database's origin matches the observed departure</td><td>Reused or misassigned callsigns</td></tr>
+          <tr><td>Heading toward destination</td><td>Air</td><td>Track within 90° of the bearing to the destination, or under 150 km from it</td><td>Route-database errors and reused callsigns; with FR24, a diversion in progress</td></tr>
+          <tr><td>Destination consistent with track</td><td>Air</td><td>Not low and descending toward an airport other than the destination</td><td>With an FR24 filed destination: a diversion in progress. With a usual-route destination: a route that cannot be relied on for this flight</td></tr>
+        </tbody>
+      </table></div>
+      <div class="sumsec amber"><div class="h">What verification cannot do</div><p>It cannot see what no receiver heard. An aircraft towed with its transponder off, parked at a field with no ADS-B coverage, or flying outside coverage is reported as UNVERIFIED, never guessed. Treat the output as surveillance evidence, not an operator statement.</p></div>
+
+      <h3 class="sec">Interfaces</h3>
+      <div class="scroll"><table>
+        <thead><tr><th>Interface</th><th>Call</th><th>Returns</th></tr></thead>
+        <tbody>
+          <tr><td>HTTP (launcher running)</td><td class="mono">GET http://127.0.0.1:8765/locate?reg=EI-DEI[,G-XWBA]&amp;days=7[&amp;format=text]</td><td>JSON: <span class="mono">text</span>, <span class="mono">verified</span>, <span class="mono">status</span> (ground | ground_off_airport | enroute | enroute_stale | unknown), <span class="mono">best_guess</span>, <span class="mono">checks[]</span>, <span class="mono">airport</span>, <span class="mono">from</span>, <span class="mono">fix</span>, <span class="mono">log[]</span>. <span class="mono">format=text</span> returns the bare line</td></tr>
+          <tr><td>HTTP relay</td><td class="mono">GET /relay?url=&lt;encoded https URL&gt;</td><td>Proxies only the allow-listed hosts above; adds CORS headers; nothing else</td></tr>
+          <tr><td>Python</td><td class="mono">import tail_locator; tail_locator.locate("EI-DEI", lookback=7)</td><td>Same dict as the HTTP JSON; <span class="mono">locate_text()</span> the line only</td></tr>
+          <tr><td>Command line</td><td class="mono">python tail_locator.py locate EI-DEI [--json] [--days 7]</td><td>The line, or the full JSON</td></tr>
+          <tr><td>This page</td><td class="mono">…/#simple=EI-DEI  or  #full=EI-DEI</td><td>Runs the lookup on load; posts <span class="mono">{type:"tail-locator", results:[{reg, text, verified, status, checks}]}</span> to <span class="mono">window.opener</span> / <span class="mono">window.parent</span></td></tr>
+        </tbody>
+      </table></div>
+
+      <h3 class="sec">Files, storage and limits</h3>
+      <ul>
+        <li><span class="mono">Tail-Locator.html</span> — this page, self-contained; airport and country data embedded. <span class="mono">tail_locator.py</span> — launcher, relay and lookup engine (Python 3.8+, standard library only). <span class="mono">airports.json</span> — the same data for the Python engine. <span class="mono">Start-Tail-Locator.bat</span> — Windows launcher. <span class="mono">tail-relay-worker.js</span> — optional Cloudflare relay for use where the launcher is not running.</li>
+        <li>Browser storage holds only settings, the last 12 registrations, and 30-day caches of identity/route lookups. Nothing is sent anywhere except the API calls listed.</li>
+        <li>Rate limits respected: 1 request/second per aggregator, OpenSky anonymous daily quota, traces fetched sequentially. A lookup for a parked aircraft typically makes 8–12 requests and takes 5–15 seconds; trace files can be 0.5–1 MB each.</li>
+        <li>Page and engine are tested against mocked API responses (47 browser cases, 17 engine cases) covering FR24-recorded diversions, reused callsigns, identity mismatches, single uncorroborated fixes and off-airport positions.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section class="card v v-settings">
+    <div class="card-h">Data sources &amp; settings <span class="r" id="settingsSummary">no relay · 7-day history · FR24 off (optional)</span></div>
+    <div class="card-b settings-grid">
+      <div class="group">
+        <h3>Free ADS-B data <span class="flag good" id="relayBadge" hidden>local relay connected</span></h3>
+        <p>Default and free: live positions from adsb.lol, airplanes.live, adsb.fi and OpenSky, plus adsb.lol's trace archive for the last two weeks of movements. These services refuse calls made directly by a web page, so the page needs a relay.</p>
+        <label>Local relay (tail_locator.py)<span class="test-out" id="localState">Checking…</span></label>
+        <p class="note">Keep <span class="mono">tail_locator.py</span>, <span class="mono">airports.json</span> and this HTML file in one folder, run <span class="mono">Start-Tail-Locator.bat</span> (or <span class="mono">python tail_locator.py</span>) and use the address it opens.</p>
+        <label>Cloud relay URL (optional — for a phone or a hosted copy of this page)
+          <input type="text" id="relayUrl" placeholder="https://tail-relay.yourname.workers.dev" autocomplete="off" spellcheck="false">
+        </label>
+        <div class="row">
+          <button class="btn small" type="button" id="relayTest">Test relay</button>
+          <button class="btn small" type="button" id="relayCopy">Copy worker code</button>
+        </div>
+        <div class="test-out" id="relayOut"></div>
+        <details><summary class="note" style="cursor:pointer">Cloudflare Worker code for a cloud relay (free plan)</summary><pre class="code" id="workerCode"></pre></details>
+        <label>Look back for movements
+          <select id="lookback"><option value="3">3 days</option><option value="7" selected>7 days</option><option value="14">14 days</option></select>
+        </label>
+      </div>
+      <div class="group">
+        <h3>Registry, routes &amp; display</h3>
+        <p>Always on, no key: identity from adsbdb.com and hexdb.io, usual routes for a callsign from adsbdb / hexdb / VRS standing data, photo from planespotters.net. Airport database: OurAirports, 9,765 airports with runway-derived boundaries, embedded in this file.</p>
+        <label>Distance units
+          <select id="units"><option value="nm" selected>nautical miles</option><option value="km">kilometres</option></select>
+        </label>
+        <p class="note">Nothing leaves this browser except the API calls themselves. Settings and the last 12 lookups are kept in this browser's local storage.</p>
+      </div>
+      <div class="group">
+        <h3>Flightradar24 API <span class="flag warn">optional · paid</span> <span class="flag good" id="fr24Badge" hidden>active</span></h3>
+        <p>Not required. A subscriber key adds FR24's filed routes and its flight history with the recorded actual arrival airport, which then take part in verification. Explorer plan is $9/month for 30,000 credits; a lookup costs about 8–30. Leave empty to stay on free data.</p>
+        <label>API key (stored only in this browser)<input type="password" id="fr24Key" placeholder="Bearer token from Key management" autocomplete="off"></label>
+        <div class="row"><label class="inline"><input type="checkbox" id="fr24Sandbox"> sandbox key (static test data)</label></div>
+        <div class="row">
+          <button class="btn small" type="button" id="fr24Test">Test key</button>
+          <button class="btn small" type="button" id="fr24Usage">Credits used (24 h)</button>
+          <button class="btn small" type="button" id="fr24Clear">Clear key</button>
+        </div>
+        <div class="test-out" id="fr24Out"></div>
+      </div>
+    </div>
+  </section>
+
+</main>
+<footer>
+  Data: adsb.lol · airplanes.live · adsb.fi · OpenSky Network · adsbdb.com · hexdb.io · planespotters.net · OurAirports · Map © OpenStreetMap contributors, © CARTO. Flightradar24 API only when a subscriber key is entered.<br>
+  Positions are surveillance data and can be wrong; confirm with the operator before dispatching anyone.
+</footer>
