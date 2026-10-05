@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: tail-locator
+    runtime: python
+    plan: free
+    buildCommand: "echo no build step"
+    startCommand: "python dist/tail_locator.py --host 0.0.0.0 --no-browser"
+    healthCheckPath: /ping
+    autoDeploy: true
