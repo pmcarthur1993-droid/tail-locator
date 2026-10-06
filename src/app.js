@@ -123,7 +123,7 @@ function relayUrl(target) {
 }
 async function detectLocalRelay() {
   if (!/^https?:$/.test(location.protocol)) return false;
-  try { const j = await getJSON(location.origin + '/ping', {}, 3000); if (j && j.relay === 'local') { state.localRelay = location.origin + '/relay'; return true; } } catch {}
+  try { const j = await getJSON(location.origin + '/ping', {}, 3000); if (j && j.relay === 'local') { state.localRelay = location.origin + '/relay'; state.serverLocate = location.origin + '/locate'; state.flightaware = !!j.flightaware; return true; } } catch {}
   return false;
 }
 
@@ -700,10 +700,10 @@ function renderSimple(items) {
   const el = $('simple');
   el.innerHTML = items.map((it, i) => {
     const v = it.verdict, text = it.line;
-    const age = it.live && isFinite(it.live.lat) ? `fix ${fmtAge((Date.now() - it.live.t) / 1000)} old via ${it.live.src}` : 'no position fix';
+    const age = it.live && it.live.t ? `fix ${fmtAge((Date.now() - it.live.t) / 1000)} old via ${it.live.src}` : 'no position fix';
     const passed = (v.checks || []).filter(c => c.ok).length, total = (v.checks || []).length;
     const checks = (v.checks || []).map(c => `<li class="${c.ok ? 'ok' : 'bad'}"><b>${c.ok ? '✓' : '✗'}</b><span>${esc(c.name)}</span><span class="d">${esc(c.detail)}</span></li>`).join('');
-    const guess = !v.verified && v.cls !== 'none' ? `<div class="sumsec amber"><div class="h">Best available reading — not verified, do not use unconfirmed</div><p class="mono">${esc(bestGuessLine(it, v))}</p></div>` : '';
+    const guess = !v.verified && v.cls !== 'none' ? `<div class="sumsec amber"><div class="h">Best available reading — not verified, do not use unconfirmed</div><p class="mono">${esc(it.best || bestGuessLine(it, v))}</p></div>` : '';
     return `<div class="line-card">
   <div class="verdict-box ${v.verified ? 'pass' : 'fail'}">
     <span class="badge-lg">${v.verified ? 'VERIFIED' : 'UNVERIFIED'}</span>
@@ -738,12 +738,22 @@ const SITE_SNIPPET = `<!-- on your page -->
 <input id="acLocation" placeholder="Aircraft location">
 <script>
 async function fillAircraftLocation(reg) {
-  const r = await fetch('http://127.0.0.1:8765/locate?reg=' + encodeURIComponent(reg));
+  const r = await fetch('__BASE__/locate?reg=' + encodeURIComponent(reg));
   const j = await r.json();            // j.text = "SNN - Shannon Airport - Ireland"
   document.getElementById('acLocation').value = j.text;   // or "Currently en route to ... from ..."
 }
 fillAircraftLocation('EI-DEI');
 <\/script>`;
+
+/* ---------- server engine (same answer the website gets) ---------- */
+const STATUS_LABEL = { ground: 'On ground', ground_off_airport: 'On ground · off-airport', enroute: 'In flight', enroute_stale: 'Last seen in flight', unknown: 'No position data' };
+const STATUS_CLS = { ground: 'ground', ground_off_airport: 'stale', enroute: 'air', enroute_stale: 'stale', unknown: 'none' };
+async function serverLocate(regs) {
+  const j = await getJSON(`${state.serverLocate}?reg=${encodeURIComponent(regs.join(','))}&days=${settings.lookback}`, {}, 180000);
+  return (j.results || []).map(r => ({ reg: r.reg, line: r.text, live: r.fix && typeof r.fix.age_s === 'number' ? { lat: r.fix.lat, t: Date.now() - r.fix.age_s * 1000, src: r.fix.source } : null,
+    verdict: { verified: !!r.verified, checks: r.checks || [], cls: STATUS_CLS[r.status] || 'none', label: STATUS_LABEL[r.status] + (r.since_utc ? ' · since ' + fmtTime(Date.parse(r.since_utc)) : ''), conf: r.confidence === 'high' ? 'high' : r.confidence === 'medium' ? 'med' : 'low', mode: r.status.startsWith('ground') ? 'ground' : r.status.startsWith('enroute') ? 'air' : 'none', via: r.fix ? r.fix.source : '', whyNot: '' },
+    best: r.best_guess, log: r.log || [] }));
+}
 
 /* ---------- lookup orchestration ---------- */
 let runToken = 0;
@@ -760,6 +770,8 @@ async function locate(text, { fromUser = true } = {}) {
   const say = (s) => { if (token === runToken) ptext.textContent = s; };
   const items = regs.map(reg => ({ reg, variants: regVariants(reg), hex: '', identity: null, live: null, fixes: [], tracePts: null, legs: [], movements: [], traceDays: [], trail: null, route: null, photo: null, log: [] }));
   const logAll = (s) => items.forEach(it => it.log.push(s));
+  let serverP = null;
+  if (state.serverLocate) { $('simple').innerHTML = '<p class="note">Asking the server engine…</p>'; serverP = serverLocate(regs).catch(e => { logAll('Server engine: ' + e.message); return null; }); }
   try {
     // 1) identity (keyless, parallel)
     say(`Resolving identity for ${regs.length} registration${regs.length > 1 ? 's' : ''}…`);
@@ -828,9 +840,13 @@ async function locate(text, { fromUser = true } = {}) {
     }));
     if (token !== runToken) return;
     // 6) decide + render
+    const serverItems = serverP ? await serverP : null;
+    if (token !== runToken) return;
+    if (serverItems && serverItems.length) logAll('Lookup line taken from the server engine (/locate), which also consults FlightAware when a key is configured');
     results.innerHTML = items.map((it, i) => { it.verdict = decide(it); verify(it, it.verdict); it.line = formatLine(it, it.verdict); return render(it, it.verdict, i); }).join('');
     items.forEach((it, i) => drawMap(i, it, it.verdict));
-    renderSimple(items); postResults(items);
+    if (serverItems && serverItems.length) { renderSimple(serverItems); postResults(serverItems); }
+    else { renderSimple(items); postResults(items); }
     if (fromUser) { LS.set('recent', [...new Set([...regs, ...LS.get('recent', [])])].slice(0, 12)); renderRecent(); }
     try { history.replaceState(null, '', '#' + (document.body.classList.contains('view-simple') ? 'simple=' : '') + regs.join(',')); } catch {}
   } catch (e) {
@@ -864,6 +880,7 @@ function refreshSettingsUI() {
   const hasKey = !!settings.fr24Key, hasCloud = !!settings.cloudRelay, local = !!state.localRelay;
   const dotRelay = $('dotRelay'); dotRelay.className = 'dot ' + (local || hasCloud ? 'on' : 'off'); dotRelay.textContent = local ? 'Local relay' : hasCloud ? 'Cloud relay' : 'No relay';
   $('dotFr24').className = 'dot ' + (hasKey ? 'on' : 'off'); $('dotFr24').textContent = hasKey ? (settings.sandbox ? 'FR24 sandbox' : 'FR24') : 'FR24 off';
+  const fa = $('dotFA'); if (fa) { fa.className = 'dot ' + (state.flightaware ? 'on' : 'off'); fa.textContent = state.flightaware ? 'FlightAware' : 'FlightAware off'; }
   $('fr24Badge').hidden = !hasKey; $('relayBadge').hidden = !(local || hasCloud); $('relayBadge').textContent = local ? 'local relay connected' : 'cloud relay set';
   $('localState').textContent = local ? `Connected — this page is being served by tail_locator.py at ${location.origin}.` : (/^https?:$/.test(location.protocol) ? 'Not detected. Start tail_locator.py and open the address it prints (http://127.0.0.1:8765/).' : 'Not detected. You opened the HTML file directly; start tail_locator.py and use the address it prints instead, or set a cloud relay below.');
   $('settingsSummary').textContent = `${local ? 'local relay' : hasCloud ? 'cloud relay' : 'no relay'} · ${settings.lookback}-day history · FR24 ${hasKey ? 'on' : 'off (optional)'}`;
@@ -920,7 +937,8 @@ async function init() {
   $('recent').addEventListener('click', (e) => { const b = e.target.closest('[data-reg]'); if (b) { input.value = b.dataset.reg; locate(b.dataset.reg); } });
   $('tabSimple').addEventListener('click', () => setView('simple')); $('tabFull').addEventListener('click', () => setView('full')); $('tabDev').addEventListener('click', () => setView('dev')); $('tabSettings').addEventListener('click', () => setView('settings'));
   $('simple').addEventListener('click', (e) => { const b = e.target.closest('[data-copy]'); if (b) { const inp = $('line-' + b.dataset.copy); copyText(inp ? inp.value : '', b); return; } const inp = e.target.closest('input.line'); if (inp) inp.select(); });
-  $('siteSnippet').textContent = SITE_SNIPPET.replace('<\\/script>', '</script>');
+  const lu = $('locateUrl'); if (lu) lu.textContent = (/^https?:$/.test(location.protocol) ? location.origin : 'http://127.0.0.1:8765') + '/locate?reg=EI-DEI';
+  $('siteSnippet').textContent = SITE_SNIPPET.replace('<\\/script>', '</script>').replace('__BASE__', /^https?:$/.test(location.protocol) ? location.origin : 'http://127.0.0.1:8765');
   let h = decodeURIComponent((location.hash || '').slice(1)); let forced = '';
   if (/^simple=/i.test(h)) { forced = 'simple'; h = h.replace(/^simple=/i, ''); } else if (/^full=/i.test(h)) { forced = 'full'; h = h.replace(/^full=/i, ''); }
   setView(forced || LS.get('view', 'simple'));
