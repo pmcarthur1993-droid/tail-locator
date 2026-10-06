@@ -379,6 +379,53 @@ def route_for(callsign, log):
     return None
 
 
+# ----------------------------------------------------------------------------- FlightAware AeroAPI (free Personal tier, server-side key)
+AEROAPI_BASE = "https://aeroapi.flightaware.com/aeroapi"
+
+
+def aeroapi_key():
+    return (os.environ.get("AEROAPI_KEY") or "").strip()
+
+
+def _iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except Exception:
+        return None
+
+
+def aeroapi_flights(canon, log):
+    """Recent flights for a registration from FlightAware: list of dicts newest-first, or None when no key / error.
+    Each: ident, origin/destination (iata, icao, name), off (actual departure epoch), on (actual arrival epoch), diverted, cancelled, progress."""
+    key = aeroapi_key()
+    if not key:
+        return None
+    req = urllib.request.Request(AEROAPI_BASE + "/flights/" + urllib.parse.quote(canon) + "?max_pages=1", headers={"x-apikey": key, "Accept": "application/json; charset=UTF-8", "User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            j = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        log.append("FlightAware: HTTP %d%s" % (e.code, " (no flights known for this registration)" if e.code == 404 else " (check the key)" if e.code in (401, 403) else ""))
+        return [] if e.code == 404 else None
+    except Exception as e:
+        log.append("FlightAware: unreachable (%s)" % str(e)[:60])
+        return None
+    out = []
+    for f in j.get("flights") or []:
+        def ap(x):
+            x = x or {}
+            return {"iata": x.get("code_iata") or "", "icao": x.get("code_icao") or x.get("code") or "", "name": x.get("name") or ""}
+        out.append({"ident": f.get("ident") or "", "reg": f.get("registration") or "", "origin": ap(f.get("origin")), "destination": ap(f.get("destination")),
+                    "off": _iso(f.get("actual_off")), "on": _iso(f.get("actual_on")), "sched_off": _iso(f.get("scheduled_off")), "est_on": _iso(f.get("estimated_on")),
+                    "diverted": bool(f.get("diverted")), "cancelled": bool(f.get("cancelled")), "progress": f.get("progress_percent"), "status": f.get("status") or "", "position_only": bool(f.get("position_only"))})
+    out.sort(key=lambda f: (f["off"] or f["sched_off"] or 0), reverse=True)
+    flown = [f for f in out if f["off"]]
+    log.append("FlightAware: %d flights, latest flown %s %s→%s %s" % (len(out), flown[0]["ident"], flown[0]["origin"]["iata"] or flown[0]["origin"]["icao"], flown[0]["destination"]["iata"] or flown[0]["destination"]["icao"], "landed" if flown[0]["on"] else "airborne") if flown else "FlightAware: no flown flights returned")
+    return out
+
+
 # ----------------------------------------------------------------------------- decision
 def _is_ground_pt(p):
     return p["alt"] == "ground" or (isinstance(p["alt"], (int, float)) and p["gs"] is not None and p["gs"] < 40 and p["alt"] < 4000)
@@ -482,8 +529,24 @@ def locate(reg, lookback=7):
         if pts and (fix is None or pts[-1]["t"] > fix["t"] + 5):
             p = pts[-1]
             fix = {"src": "adsb.lol trace", "t": p["t"], "lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "gs": p["gs"], "vs": p["vs"], "callsign": _last_callsign(pts), "hex": hx.upper(), "reg": (trace_meta or {}).get("r", "") or canon, "type": ""}
+    # --- FlightAware record (when a server-side key is configured): authoritative departure/arrival events
+    fa_flights = aeroapi_flights(canon, log)
+    fa_last = next((f for f in (fa_flights or []) if f["off"]), None)
+    fa_landed = fa_last if fa_last and fa_last["on"] else None
+    fa_airborne = fa_last if fa_last and not fa_last["on"] and not fa_last["cancelled"] else None
+    fa_event_t = (fa_landed["on"] if fa_landed else fa_airborne["off"] if fa_airborne else None)
+    # Provider record newer than any position fix wins: a landing recorded after the last fix means the trace lost the final approach
+    if fa_event_t and (fix is None or fa_event_t > fix["t"] + 5):
+        if fa_landed:
+            apt = airport_by_codes(fa_landed["destination"]["iata"], fa_landed["destination"]["icao"])
+            if apt:
+                fix = {"src": "FlightAware record", "t": fa_landed["on"], "lat": apt["lat"], "lon": apt["lon"], "alt": "ground", "gs": 0, "vs": 0, "track": None, "callsign": fa_landed["ident"], "hex": hx.upper(), "reg": fa_landed["reg"] or canon, "type": "", "record": fa_landed}
+        elif fa_airborne and (fix is None or not fresh):
+            fix = {"src": "FlightAware record", "t": fa_airborne["off"], "lat": float("nan"), "lon": float("nan"), "alt": None, "gs": None, "vs": None, "track": None, "callsign": fa_airborne["ident"], "hex": hx.upper(), "reg": fa_airborne["reg"] or canon, "type": "", "record": fa_airborne}
+    if fix and fix["src"] == "FlightAware record" and fix.get("record") and not fix["record"]["on"]:
+        return _locate_airborne_record(out, canon, fix["record"], fa_flights, now, lookback, check)
     # --- check 1: identity
-    names = [f.get("reg") for f in fixes if f.get("reg")] + ([trace_meta.get("r")] if trace_meta and trace_meta.get("r") else [])
+    names = [f.get("reg") for f in fixes if f.get("reg")] + ([trace_meta.get("r")] if trace_meta and trace_meta.get("r") else []) + ([fa_last["reg"]] if fa_last and fa_last["reg"] else [])
     mism = [n for n in names if reg_key(n) != reg_key(canon)]
     hexes = {h.upper() for h in [f.get("hex") for f in fixes] + [hx, (trace_meta or {}).get("icao", "")] if h}
     check("Identity", not mism and len(hexes) <= 1 and (names or hx), ("source reports %s, not %s" % (mism[0], canon)) if mism else ("conflicting Mode S codes %s" % ", ".join(sorted(hexes))) if len(hexes) > 1 else ("%d source(s) name %s%s" % (len(names), canon, (", hex " + hx) if hx else "")) if (names or hx) else "no source confirms this registration")
@@ -524,6 +587,11 @@ def locate(reg, lookback=7):
         ground_fresh = [f for f in fresh_fixes if f["alt"] == "ground" or (isinstance(f["alt"], (int, float)) and f["alt"] - elev <= 1500)]
         if len(ground_fresh) > 1 and agree:
             corr = "%d independent live sources" % len(ground_fresh)
+        if not corr and fix.get("record"):
+            rec = fix["record"]
+            corr = "FlightAware recorded %s landing at %s %s%s" % (rec["ident"], a["iata"] or a["code"], _fmt_z(rec["on"]), " (DIVERTED from %s)" % (rec["destination"]["iata"]) if rec["diverted"] else "")
+        if not corr and fa_landed and airport_by_codes(fa_landed["destination"]["iata"], fa_landed["destination"]["icao"]) is a:
+            corr = "FlightAware recorded %s landing here %s" % (fa_landed["ident"], _fmt_z(fa_landed["on"]))
         if not corr and pts:
             n, span = _ground_dwell(pts, a)
             if n >= 3 and span >= 120:
@@ -531,7 +599,12 @@ def locate(reg, lookback=7):
             else:
                 why = ("only %d ground position(s) in the trace at %s" % (n, a["iata"] or a["code"])) if n else "trace does not end on the ground here"
         check("Corroborated", bool(corr), corr or why)
+        if fa_flights is not None and fa_landed:
+            later = [f for f in fa_flights if f["off"] and f["off"] > fa_landed["on"]]
+            check("No later departure", not later, "FlightAware shows no departure after that landing" if not later else "FlightAware shows %s departed %s afterwards" % (later[0]["ident"], _fmt_z(later[0]["off"])))
         check("Recent enough", age <= 3 * 86400, "fix %s old" % _fmt_age(age) + ("" if age <= 3 * 86400 else " - confirm manually"))
+        if fix.get("record") and fix["record"]["diverted"]:
+            out["diverted"] = True
         out["status"] = "ground" if inside else "ground_off_airport"
         out["confidence"] = "high" if (inside and age < 3 * 86400) else "low"
         line = airport_line(a) if inside else "%s (nearest airport, %.0f nm away, position is off-airport)" % (airport_line(a), a["dist"] / 1.852)
@@ -574,6 +647,30 @@ def locate(reg, lookback=7):
         out["text"] = line
     else:
         out["text"] = "UNVERIFIED - manual check required - " + "; ".join("%s: %s" % (c["name"], c["detail"]) for c in checks if not c["ok"])
+    return out
+
+
+def _locate_airborne_record(out, canon, rec, fa_flights, now, lookback, check):
+    """In flight according to FlightAware's departure record, with no usable live position."""
+    dest = airport_by_codes(rec["destination"]["iata"], rec["destination"]["icao"])
+    orig = airport_by_codes(rec["origin"]["iata"], rec["origin"]["icao"])
+    check("Identity", not rec["reg"] or reg_key(rec["reg"]) == reg_key(canon), "FlightAware record names %s" % (rec["reg"] or canon))
+    check("Departure recorded", bool(rec["off"] and orig), "FlightAware: %s departed %s %s" % (rec["ident"], orig["iata"] if orig else "?", _fmt_z(rec["off"])) if rec["off"] else "no departure time")
+    check("Destination filed", bool(dest), ("%s%s" % (dest["iata"] or dest["code"], " (diverted)" if rec["diverted"] else "")) if dest else "destination unknown")
+    check("Still airborne", (now - rec["off"]) < 20 * 3600, "departed %s ago, no arrival recorded yet" % _fmt_age(now - rec["off"]) if (now - rec["off"]) < 20 * 3600 else "departed %s ago with no arrival recorded - record is stale" % _fmt_age(now - rec["off"]))
+    out["status"] = "enroute"
+    out["confidence"] = "high" if dest and orig else "medium"
+    out["fix"] = {"source": "FlightAware record", "time_utc": datetime.fromtimestamp(rec["off"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "age_s": int(now - rec["off"]), "callsign": rec["ident"], "progress_percent": rec["progress"]}
+    if dest:
+        out["airport"] = {"iata": dest["iata"], "icao": dest["code"], "name": dest["name"], "country": country_name(dest["country"]), "basis": "FlightAware filed destination" + (" (diverted)" if rec["diverted"] else "")}
+    if orig:
+        out["from"] = {"iata": orig["iata"], "icao": orig["code"], "name": orig["name"], "country": country_name(orig["country"])}
+    if rec["diverted"]:
+        out["diverted"] = True
+    line = "Currently en route to %s from %s" % (airport_line(dest) if dest else "destination not available", airport_line(orig) if orig else "departure airport not available")
+    out["verified"] = all(c["ok"] for c in out["checks"])
+    out["best_guess"] = line
+    out["text"] = line if out["verified"] else "UNVERIFIED - manual check required - " + "; ".join("%s: %s" % (c["name"], c["detail"]) for c in out["checks"] if not c["ok"])
     return out
 
 
@@ -620,7 +717,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path in ("/", "/index.html"):
             return self.serve_html()
         if u.path == "/ping":
-            return self._send(200, json.dumps({"ok": True, "relay": "local", "version": "2.1", "locate": "/locate?reg=EI-DEI"}))
+            return self._send(200, json.dumps({"ok": True, "relay": "local", "version": "2.4", "locate": "/locate?reg=EI-DEI", "flightaware": bool(aeroapi_key())}))
         if u.path == "/relay":
             return self.relay(q.get("url", [""])[0])
         if u.path == "/locate":
@@ -710,7 +807,7 @@ def main():
     print("  page:    %s" % url)
     print("  locate:  %slocate?reg=EI-DEI   (JSON; add &format=text for the bare line)" % url)
     print("  relay:   %srelay?url=...   allowed: %s" % (url, ", ".join(sorted(ALLOW))))
-    print("  airports: %d loaded   stop: Ctrl+C" % len(airports()))
+    print("  airports: %d loaded   FlightAware key: %s   stop: Ctrl+C" % (len(airports()), "set" if aeroapi_key() else "not set (AEROAPI_KEY)"))
     if not args.no_browser and not hosted:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:

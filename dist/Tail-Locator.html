@@ -213,10 +213,11 @@
     <span class="dots" aria-label="Data sources">
       <span class="dot off" id="dotRelay">No relay</span>
       <span class="dot on" id="dotStatic">Registry</span>
+      <span class="dot off" id="dotFA">FlightAware off</span>
       <span class="dot off" id="dotFr24">FR24 off</span>
     </span>
     <span class="utc"><span id="utcClock">--:--:--</span>Z</span>
-    <span class="ver">v2.3</span>
+    <span class="ver">v2.4</span>
   </div>
 </header>
 
@@ -296,6 +297,7 @@
           <tr><td>OpenSky Network</td><td class="mono">opensky-network.org/api/states/all?icao24={hex}</td><td>State vector: position, baro altitude (m), on-ground flag, velocity (m/s), track, vertical rate, squawk, callsign, position source</td><td>Independent live fix; units converted to ft / kt / fpm</td><td>Anonymous access, ~400 credits per day, through the relay. CC BY-SA research licence</td></tr>
           <tr><td>OurAirports</td><td class="mono">embedded (airports.json / window.AIRPORTS)</td><td>9,765 airports: ICAO, IATA, position, name, city, country, size, field elevation, boundary radius computed from runway-end coordinates (+1.5 km, floor 1.5–3.5 km by size)</td><td>Nearest-airport match; "inside boundary" test; IATA code and country name for the output line</td><td>Public domain. Large and medium airports, plus small ones with an IATA code or scheduled service; heliports and closed fields excluded</td></tr>
           <tr><td>planespotters.net</td><td class="mono">api.planespotters.net/pub/photos/reg/{reg}</td><td>Photo thumbnail with photographer credit</td><td>Full detail tab only</td><td>Free, direct, credit required</td></tr>
+          <tr><td>FlightAware AeroAPI (server-side, free Personal tier)</td><td class="mono">aeroapi.flightaware.com/aeroapi/flights/{reg}</td><td>Recent flights for the registration: ident, origin, destination, actual departure and arrival times, diverted / cancelled flags, progress</td><td>Authoritative departure and landing events — used when the community feeds have no coverage (mainland China, parts of Africa, Central Asia, oceanic) or lost the track on final approach. A recorded landing newer than the last fix wins. Called by the server only; the key is an environment variable (<span class="mono">AEROAPI_KEY</span>), never in the browser</td><td>Free Personal tier ($5/month usage credit, ~1,000 lookups; non-commercial; 10 result sets/min). Without a key this source is skipped</td></tr>
           <tr><td>Flightradar24 API (optional)</td><td class="mono">fr24api.flightradar24.com/api/live/flight-positions/full<br>…/api/flight-summary/full</td><td>Live position with filed origin/destination and ETA; flight history with recorded actual arrival airport</td><td>Only when a subscriber key is entered; filed route and landing record then join the verification</td><td>Paid (Explorer $9/month, 30,000 credits). Not used by default</td></tr>
         </tbody>
       </table></div>
@@ -329,6 +331,7 @@
           <tr><td>Destination consistent with track</td><td>Air</td><td>Not low and descending toward an airport other than the destination</td><td>With an FR24 filed destination: a diversion in progress. With a usual-route destination: a route that cannot be relied on for this flight</td></tr>
         </tbody>
       </table></div>
+      <div class="sumsec amber"><div class="h">Coverage</div><p>The community feeds depend on volunteer receivers. Coverage is dense over Europe, North America, Japan, Australia and most of Asia-Pacific, and thin or absent over mainland China, much of Africa, Central Asia and the oceans — an aircraft there shows as "track lost" or "not seen". The FlightAware record closes that gap for arrivals and departures (not live position). The Lookup tab and <span class="mono">/locate</span> use the server engine, which includes FlightAware; the Full detail tab is the browser's own view of the free feeds.</p></div>
       <div class="sumsec amber"><div class="h">What verification cannot do</div><p>It cannot see what no receiver heard. An aircraft towed with its transponder off, parked at a field with no ADS-B coverage, or flying outside coverage is reported as UNVERIFIED, never guessed. Treat the output as surveillance evidence, not an operator statement.</p></div>
 
       <h3 class="sec">Interfaces</h3>
@@ -533,7 +536,7 @@ function relayUrl(target) {
 }
 async function detectLocalRelay() {
   if (!/^https?:$/.test(location.protocol)) return false;
-  try { const j = await getJSON(location.origin + '/ping', {}, 3000); if (j && j.relay === 'local') { state.localRelay = location.origin + '/relay'; return true; } } catch {}
+  try { const j = await getJSON(location.origin + '/ping', {}, 3000); if (j && j.relay === 'local') { state.localRelay = location.origin + '/relay'; state.serverLocate = location.origin + '/locate'; state.flightaware = !!j.flightaware; return true; } } catch {}
   return false;
 }
 
@@ -1110,10 +1113,10 @@ function renderSimple(items) {
   const el = $('simple');
   el.innerHTML = items.map((it, i) => {
     const v = it.verdict, text = it.line;
-    const age = it.live && isFinite(it.live.lat) ? `fix ${fmtAge((Date.now() - it.live.t) / 1000)} old via ${it.live.src}` : 'no position fix';
+    const age = it.live && it.live.t ? `fix ${fmtAge((Date.now() - it.live.t) / 1000)} old via ${it.live.src}` : 'no position fix';
     const passed = (v.checks || []).filter(c => c.ok).length, total = (v.checks || []).length;
     const checks = (v.checks || []).map(c => `<li class="${c.ok ? 'ok' : 'bad'}"><b>${c.ok ? '✓' : '✗'}</b><span>${esc(c.name)}</span><span class="d">${esc(c.detail)}</span></li>`).join('');
-    const guess = !v.verified && v.cls !== 'none' ? `<div class="sumsec amber"><div class="h">Best available reading — not verified, do not use unconfirmed</div><p class="mono">${esc(bestGuessLine(it, v))}</p></div>` : '';
+    const guess = !v.verified && v.cls !== 'none' ? `<div class="sumsec amber"><div class="h">Best available reading — not verified, do not use unconfirmed</div><p class="mono">${esc(it.best || bestGuessLine(it, v))}</p></div>` : '';
     return `<div class="line-card">
   <div class="verdict-box ${v.verified ? 'pass' : 'fail'}">
     <span class="badge-lg">${v.verified ? 'VERIFIED' : 'UNVERIFIED'}</span>
@@ -1155,6 +1158,16 @@ async function fillAircraftLocation(reg) {
 fillAircraftLocation('EI-DEI');
 <\/script>`;
 
+/* ---------- server engine (same answer the website gets) ---------- */
+const STATUS_LABEL = { ground: 'On ground', ground_off_airport: 'On ground · off-airport', enroute: 'In flight', enroute_stale: 'Last seen in flight', unknown: 'No position data' };
+const STATUS_CLS = { ground: 'ground', ground_off_airport: 'stale', enroute: 'air', enroute_stale: 'stale', unknown: 'none' };
+async function serverLocate(regs) {
+  const j = await getJSON(`${state.serverLocate}?reg=${encodeURIComponent(regs.join(','))}&days=${settings.lookback}`, {}, 180000);
+  return (j.results || []).map(r => ({ reg: r.reg, line: r.text, live: r.fix && typeof r.fix.age_s === 'number' ? { lat: r.fix.lat, t: Date.now() - r.fix.age_s * 1000, src: r.fix.source } : null,
+    verdict: { verified: !!r.verified, checks: r.checks || [], cls: STATUS_CLS[r.status] || 'none', label: STATUS_LABEL[r.status] + (r.since_utc ? ' · since ' + fmtTime(Date.parse(r.since_utc)) : ''), conf: r.confidence === 'high' ? 'high' : r.confidence === 'medium' ? 'med' : 'low', mode: r.status.startsWith('ground') ? 'ground' : r.status.startsWith('enroute') ? 'air' : 'none', via: r.fix ? r.fix.source : '', whyNot: '' },
+    best: r.best_guess, log: r.log || [] }));
+}
+
 /* ---------- lookup orchestration ---------- */
 let runToken = 0;
 function fresher(a, b) { if (!a) return b; if (!b) return a; return (b.t || 0) > (a.t || 0) + 5000 ? b : a; }
@@ -1170,6 +1183,8 @@ async function locate(text, { fromUser = true } = {}) {
   const say = (s) => { if (token === runToken) ptext.textContent = s; };
   const items = regs.map(reg => ({ reg, variants: regVariants(reg), hex: '', identity: null, live: null, fixes: [], tracePts: null, legs: [], movements: [], traceDays: [], trail: null, route: null, photo: null, log: [] }));
   const logAll = (s) => items.forEach(it => it.log.push(s));
+  let serverP = null;
+  if (state.serverLocate) { $('simple').innerHTML = '<p class="note">Asking the server engine…</p>'; serverP = serverLocate(regs).catch(e => { logAll('Server engine: ' + e.message); return null; }); }
   try {
     // 1) identity (keyless, parallel)
     say(`Resolving identity for ${regs.length} registration${regs.length > 1 ? 's' : ''}…`);
@@ -1238,9 +1253,13 @@ async function locate(text, { fromUser = true } = {}) {
     }));
     if (token !== runToken) return;
     // 6) decide + render
+    const serverItems = serverP ? await serverP : null;
+    if (token !== runToken) return;
+    if (serverItems && serverItems.length) logAll('Lookup line taken from the server engine (/locate), which also consults FlightAware when a key is configured');
     results.innerHTML = items.map((it, i) => { it.verdict = decide(it); verify(it, it.verdict); it.line = formatLine(it, it.verdict); return render(it, it.verdict, i); }).join('');
     items.forEach((it, i) => drawMap(i, it, it.verdict));
-    renderSimple(items); postResults(items);
+    if (serverItems && serverItems.length) { renderSimple(serverItems); postResults(serverItems); }
+    else { renderSimple(items); postResults(items); }
     if (fromUser) { LS.set('recent', [...new Set([...regs, ...LS.get('recent', [])])].slice(0, 12)); renderRecent(); }
     try { history.replaceState(null, '', '#' + (document.body.classList.contains('view-simple') ? 'simple=' : '') + regs.join(',')); } catch {}
   } catch (e) {
@@ -1274,6 +1293,7 @@ function refreshSettingsUI() {
   const hasKey = !!settings.fr24Key, hasCloud = !!settings.cloudRelay, local = !!state.localRelay;
   const dotRelay = $('dotRelay'); dotRelay.className = 'dot ' + (local || hasCloud ? 'on' : 'off'); dotRelay.textContent = local ? 'Local relay' : hasCloud ? 'Cloud relay' : 'No relay';
   $('dotFr24').className = 'dot ' + (hasKey ? 'on' : 'off'); $('dotFr24').textContent = hasKey ? (settings.sandbox ? 'FR24 sandbox' : 'FR24') : 'FR24 off';
+  const fa = $('dotFA'); if (fa) { fa.className = 'dot ' + (state.flightaware ? 'on' : 'off'); fa.textContent = state.flightaware ? 'FlightAware' : 'FlightAware off'; }
   $('fr24Badge').hidden = !hasKey; $('relayBadge').hidden = !(local || hasCloud); $('relayBadge').textContent = local ? 'local relay connected' : 'cloud relay set';
   $('localState').textContent = local ? `Connected — this page is being served by tail_locator.py at ${location.origin}.` : (/^https?:$/.test(location.protocol) ? 'Not detected. Start tail_locator.py and open the address it prints (http://127.0.0.1:8765/).' : 'Not detected. You opened the HTML file directly; start tail_locator.py and use the address it prints instead, or set a cloud relay below.');
   $('settingsSummary').textContent = `${local ? 'local relay' : hasCloud ? 'cloud relay' : 'no relay'} · ${settings.lookback}-day history · FR24 ${hasKey ? 'on' : 'off (optional)'}`;
