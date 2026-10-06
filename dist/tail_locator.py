@@ -48,7 +48,7 @@ FRESH_S = 15 * 60
 ALLOW = {
     "api.adsb.lol", "globe.adsb.lol", "adsb.lol",
     "api.airplanes.live", "opendata.adsb.fi", "api.adsb.one", "opensky-network.org",
-    "api.adsbdb.com", "hexdb.io", "vrs-standing-data.adsb.lol", "api.planespotters.net",
+    "api.adsbdb.com", "hexdb.io", "vrs-standing-data.adsb.lol", "api.planespotters.net", "fr24api.flightradar24.com",
 }
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -407,10 +407,18 @@ def aeroapi_key():
 def _iso(s):
     if not s:
         return None
-    try:
-        return datetime.strptime(s.replace("Z", "+0000"), "%Y-%m-%dT%H:%M:%S%z").timestamp()
-    except Exception:
-        return None
+    s = str(s).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+0000"
+    elif not re.search(r"[+-]\d{2}:?\d{2}$", s):
+        s = s + "+0000"
+    s = re.sub(r"([+-]\d{2}):(\d{2})$", r"\1\2", s)
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%d %H:%M:%S%z"):
+        try:
+            return datetime.strptime(s, fmt).timestamp()
+        except Exception:
+            pass
+    return None
 
 
 def aeroapi_flights(canon, log):
@@ -437,10 +445,124 @@ def aeroapi_flights(canon, log):
         out.append({"ident": f.get("ident") or "", "reg": f.get("registration") or "", "origin": ap(f.get("origin")), "destination": ap(f.get("destination")),
                     "off": _iso(f.get("actual_off")), "on": _iso(f.get("actual_on")), "sched_off": _iso(f.get("scheduled_off")), "est_on": _iso(f.get("estimated_on")),
                     "diverted": bool(f.get("diverted")), "cancelled": bool(f.get("cancelled")), "progress": f.get("progress_percent"), "status": f.get("status") or "", "position_only": bool(f.get("position_only"))})
+    for f in out:
+        f["provider"] = "FlightAware"
+        f["filed_destination"] = f["destination"]
     out.sort(key=lambda f: (f["off"] or f["sched_off"] or 0), reverse=True)
     flown = [f for f in out if f["off"]]
     log.append("FlightAware: %d flights, latest flown %s %s→%s %s" % (len(out), flown[0]["ident"], flown[0]["origin"]["iata"] or flown[0]["origin"]["icao"], flown[0]["destination"]["iata"] or flown[0]["destination"]["icao"], "landed" if flown[0]["on"] else "airborne") if flown else "FlightAware: no flown flights returned")
     return out
+
+
+# ----------------------------------------------------------------------------- Flightradar24 API (primary source whenever a key is present)
+FR24_BASE = "https://fr24api.flightradar24.com/api"
+_REQ = threading.local()          # per-request key passed by the page (X-FR24-Key header) when the server has none
+
+
+def fr24_key():
+    k = (getattr(_REQ, "fr24_key", "") or os.environ.get("FR24_KEY") or os.environ.get("FR24_API_KEY") or "").strip()
+    if not k:
+        try:
+            with open(os.path.join(HERE, "fr24.key"), "r", encoding="utf-8") as f:
+                k = f.read().strip()
+        except Exception:
+            k = ""
+    return k
+
+
+def _fr24_fetch(url, headers):
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def fr24_get(path, params, log, label):
+    """GET one FR24 endpoint. Returns the parsed JSON, [] for 'no data' answers, or None on error (logged)."""
+    key = fr24_key()
+    if not key:
+        return None
+    url = FR24_BASE + path + "?" + urllib.parse.urlencode(params)
+    try:
+        return json.loads(_fr24_fetch(url, {"Accept": "application/json", "Accept-Version": "v1", "Authorization": "Bearer " + key, "User-Agent": UA}))
+    except urllib.error.HTTPError as e:
+        why = {400: "bad request (parameters)", 401: "key rejected - check the token", 402: "no credits left on the FR24 account", 403: "key not allowed for this endpoint - check the subscription",
+               404: "no data", 429: "rate limited by FR24 - retry shortly"}.get(e.code, "")
+        log.append("Flightradar24 %s: HTTP %d%s" % (label, e.code, (" - " + why) if why else ""))
+        return [] if e.code == 404 else None
+    except Exception as e:
+        log.append("Flightradar24 %s: unreachable (%s)" % (label, str(e)[:60]))
+        return None
+
+
+def fr24_live(canon, log):
+    """Live position for the registration from FR24 (full), as a fix dict, or None."""
+    j = fr24_get("/live/flight-positions/full", {"registrations": canon}, log, "live")
+    rows = (j or {}).get("data") if isinstance(j, dict) else None
+    if not rows:
+        if j is not None:
+            log.append("Flightradar24 live: not airborne / not transmitting")
+        return None
+    d = next((d for d in rows if reg_key(d.get("reg")) == reg_key(canon)), rows[0])
+    t = _iso(d.get("timestamp")) or time.time()
+    alt = d.get("alt")
+    gs = d.get("gspeed")
+    on_gnd = isinstance(alt, (int, float)) and alt <= 0 and (gs is None or gs < 50)
+    fix = {"src": "Flightradar24 live", "t": t, "lat": d.get("lat"), "lon": d.get("lon"), "alt": "ground" if on_gnd else alt, "gs": gs, "vs": d.get("vspeed"),
+           "track": d.get("track") if isinstance(d.get("track"), (int, float)) else None, "callsign": (d.get("callsign") or d.get("flight") or "").strip(),
+           "hex": (d.get("hex") or "").upper(), "reg": (d.get("reg") or "").strip(), "type": d.get("type") or "",
+           "fr24": {"flight": d.get("flight") or "", "orig": (d.get("orig_iata") or "", d.get("orig_icao") or ""), "dest": (d.get("dest_iata") or "", d.get("dest_icao") or ""),
+                    "eta": _iso(d.get("eta")), "source": d.get("source") or "", "fr24_id": d.get("fr24_id") or ""}}
+    if not isinstance(fix["lat"], (int, float)) or not isinstance(fix["lon"], (int, float)):
+        return None
+    log.append("Flightradar24 live: position %s (%s)" % (_fmt_z(t), fix["fr24"]["source"] or "ADS-B"))
+    return fix
+
+
+def fr24_summary(canon, lookback, log):
+    """Recent flights for the registration from FR24 flight-summary (full), newest first, in the common provider-record shape, or None."""
+    now = datetime.now(timezone.utc)
+    frm = now - timedelta(days=max(1, min(13, lookback)))
+    j = fr24_get("/flight-summary/full", {"registrations": canon, "flight_datetime_from": frm.strftime("%Y-%m-%dT%H:%M:%SZ"), "flight_datetime_to": (now + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"), "sort": "desc", "limit": 20}, log, "summary")
+    if j is None:
+        return None
+    rows = j.get("data") if isinstance(j, dict) else []
+    out = []
+    for f in rows or []:
+        dest_iata, dest_icao = f.get("dest_iata") or "", f.get("dest_icao") or ""
+        act_iata, act_icao = f.get("dest_iata_actual") or "", f.get("dest_icao_actual") or ""
+        if act_iata and dest_iata:
+            diverted = act_iata != dest_iata
+        elif act_icao and dest_icao:
+            diverted = act_icao != dest_icao
+        else:
+            diverted = False
+        out.append({"provider": "Flightradar24", "ident": (f.get("flight") or f.get("callsign") or "").strip(), "reg": (f.get("reg") or "").strip(),
+                    "origin": {"iata": f.get("orig_iata") or "", "icao": f.get("orig_icao") or "", "name": ""},
+                    "destination": {"iata": act_iata or dest_iata, "icao": act_icao or dest_icao, "name": ""},
+                    "filed_destination": {"iata": dest_iata, "icao": dest_icao, "name": ""},
+                    "off": _iso(f.get("datetime_takeoff")), "on": _iso(f.get("datetime_landed")), "sched_off": _iso(f.get("first_seen")), "est_on": None,
+                    "diverted": diverted, "cancelled": False, "progress": None, "status": "ended" if f.get("flight_ended") else "live", "position_only": False,
+                    "first_seen": _iso(f.get("first_seen")), "last_seen": _iso(f.get("last_seen")), "ended": bool(f.get("flight_ended")), "fr24_id": f.get("fr24_id") or ""})
+    out.sort(key=lambda f: (f["off"] or f["sched_off"] or 0), reverse=True)
+    flown = [f for f in out if f["off"]]
+    log.append("Flightradar24 summary: %d flights in %d days, latest %s %s→%s %s%s" % (len(out), max(1, min(13, lookback)), flown[0]["ident"], flown[0]["origin"]["iata"] or flown[0]["origin"]["icao"], flown[0]["destination"]["iata"] or flown[0]["destination"]["icao"],
+                                                                                        "landed %s" % _fmt_z(flown[0]["on"]) if flown[0]["on"] else "airborne", " DIVERTED" if flown[0]["diverted"] else "") if flown else "Flightradar24 summary: no flights in the window")
+    return out
+
+
+def provider_flights(canon, lookback, log):
+    """Flight records from the best configured provider: Flightradar24 first, FlightAware as fallback. (list or None, provider name)."""
+    if fr24_key():
+        fl = fr24_summary(canon, lookback, log)
+        if fl is not None:
+            return fl, "Flightradar24"
+    fl = aeroapi_flights(canon, log)
+    if fl is not None:
+        for f in fl:
+            f.setdefault("provider", "FlightAware")
+            f.setdefault("filed_destination", f["destination"])
+        return fl, "FlightAware"
+    return None, ""
 
 
 # ----------------------------------------------------------------------------- decision
@@ -525,7 +647,7 @@ def _terminal_candidates(p, leaving, prefer=None):
             if _ang_diff(trk, brg) > 90:
                 continue
         out.append(a)
-    out.sort(key=lambda a: (0 if (prefer and a["code"] == prefer["code"]) else 1, -SIZE_RANK.get(a["size"], 0), a["dist"]))
+    out.sort(key=lambda a: (0 if (prefer and a["code"] == prefer["code"]) else 1, 0 if a.get("iata") else 1, -SIZE_RANK.get(a["size"], 0), a["dist"]))
     return out
 
 
@@ -576,6 +698,8 @@ def _leg_arrival(leg, silence, prefer=None):
         descending = True
     if not descending:
         return None, "leg ends in level flight (%s ft, %s kt)" % (last["alt"], last["gs"])
+    if last["gs"] is not None and last["gs"] > 300:
+        return None, "leg ends descending but at %d kt - not on approach" % last["gs"]
     cands = _terminal_candidates(last, leaving=False, prefer=prefer)
     if not cands:
         return None, "leg ends descending but not over any airport's terminal area (%s ft)" % last["alt"]
@@ -709,6 +833,11 @@ def locate(reg, lookback=7):
     os_fix = live_opensky(hx, log)
     if os_fix:
         fixes.append(os_fix)
+    fr_live = fr24_live(canon, log) if fr24_key() else None
+    if fr_live:
+        fixes.append(fr_live)
+        if not hx and fr_live["hex"]:
+            hx = fr_live["hex"]
     fix = max(fixes, key=lambda f: f["t"]) if fixes else None
     now = time.time()
     fresh = fix is not None and (now - fix["t"]) <= FRESH_S
@@ -727,22 +856,25 @@ def locate(reg, lookback=7):
                 for k in ("gs", "track", "vs"):
                     if fix[k] is None and q.get(k) is not None:
                         fix[k] = q[k]
-    # --- FlightAware record (when a server-side key is configured): authoritative departure/arrival events
-    fa_flights = aeroapi_flights(canon, log)
+    # --- Provider flight records (Flightradar24 when a key is present, else FlightAware): authoritative departure/arrival events
+    fa_flights, prov = provider_flights(canon, lookback, log)
+    if prov:
+        out["provider"] = prov
     fa_last = next((f for f in (fa_flights or []) if f["off"]), None)
     fa_landed = fa_last if fa_last and fa_last["on"] else None
     fa_airborne = fa_last if fa_last and not fa_last["on"] and not fa_last["cancelled"] else None
     fa_event_t = (fa_landed["on"] if fa_landed else fa_airborne["off"] if fa_airborne else None)
+    rec_src = "%s record" % prov
     # Provider record newer than any position fix wins: a landing recorded after the last fix means the trace lost the final approach
     if fa_event_t and (fix is None or fa_event_t > fix["t"] + 5):
         if fa_landed:
             apt = airport_by_codes(fa_landed["destination"]["iata"], fa_landed["destination"]["icao"])
             if apt:
-                fix = {"src": "FlightAware record", "t": fa_landed["on"], "lat": apt["lat"], "lon": apt["lon"], "alt": "ground", "gs": 0, "vs": 0, "track": None, "callsign": fa_landed["ident"], "hex": hx.upper(), "reg": fa_landed["reg"] or canon, "type": "", "record": fa_landed}
+                fix = {"src": rec_src, "t": fa_landed["on"], "lat": apt["lat"], "lon": apt["lon"], "alt": "ground", "gs": 0, "vs": 0, "track": None, "callsign": fa_landed["ident"], "hex": hx.upper(), "reg": fa_landed["reg"] or canon, "type": "", "record": fa_landed}
         elif fa_airborne and (fix is None or not fresh):
-            fix = {"src": "FlightAware record", "t": fa_airborne["off"], "lat": float("nan"), "lon": float("nan"), "alt": None, "gs": None, "vs": None, "track": None, "callsign": fa_airborne["ident"], "hex": hx.upper(), "reg": fa_airborne["reg"] or canon, "type": "", "record": fa_airborne}
-    if fix and fix["src"] == "FlightAware record" and fix.get("record") and not fix["record"]["on"]:
-        return _locate_airborne_record(out, canon, fix["record"], fa_flights, now, lookback, check)
+            fix = {"src": rec_src, "t": fa_airborne["off"], "lat": float("nan"), "lon": float("nan"), "alt": None, "gs": None, "vs": None, "track": None, "callsign": fa_airborne["ident"], "hex": hx.upper(), "reg": fa_airborne["reg"] or canon, "type": "", "record": fa_airborne}
+    if fix and fix["src"] == rec_src and fix.get("record") and not fix["record"]["on"]:
+        return _locate_airborne_record(out, canon, fix["record"], fa_flights, now, lookback, check, prov)
     # --- check 1: identity
     names = [f.get("reg") for f in fixes if f.get("reg")] + ([trace_meta.get("r")] if trace_meta and trace_meta.get("r") else []) + ([fa_last["reg"]] if fa_last and fa_last["reg"] else [])
     mism = [n for n in names if reg_key(n) != reg_key(canon)]
@@ -761,11 +893,25 @@ def locate(reg, lookback=7):
     elev = n0["elev"] if n0 and n0.get("elev") is not None else 0
     alt = fix["alt"]
     on_ground = alt == "ground" or (isinstance(alt, (int, float)) and (fix["gs"] is None or fix["gs"] <= 60) and (alt - elev) <= 1500 and (fix["vs"] is None or abs(fix["vs"]) < 300))
-    # route database for the current callsign (used both for the airborne line and to settle terminal-area ambiguity)
+    # route for the current flight: Flightradar24's filed route when available (live position or current summary record),
+    # otherwise the community route database for the callsign
     cs = fix["callsign"] or _last_callsign(pts)
-    route = route_for(cs, log) if cs else None
+    route = None
+    fr_now = fix.get("fr24") if fix.get("src") == "Flightradar24 live" else None
+    if fr_now and (fr_now["dest"][0] or fr_now["dest"][1]):
+        route = {"orig": fr_now["orig"], "dest": fr_now["dest"], "src": "Flightradar24 live"}
+    elif fa_airborne and fa_airborne["provider"] == "Flightradar24" and (fa_airborne["destination"]["iata"] or fa_airborne["destination"]["icao"]):
+        route = {"orig": (fa_airborne["origin"]["iata"], fa_airborne["origin"]["icao"]), "dest": (fa_airborne["destination"]["iata"], fa_airborne["destination"]["icao"]), "src": "Flightradar24 summary"}
+    if route is None:
+        route = route_for(cs, log) if cs else None
     dest = airport_by_codes(*route["dest"]) if route else None
     route_orig = airport_by_codes(*route["orig"]) if route else None
+    # a diversion recorded by the provider for the flight in progress overrides the filed destination
+    if fa_airborne and fa_airborne["diverted"] and airport_by_codes(fa_airborne["destination"]["iata"], fa_airborne["destination"]["icao"]):
+        dest = airport_by_codes(fa_airborne["destination"]["iata"], fa_airborne["destination"]["icao"])
+        route = dict(route or {"orig": (fa_airborne["origin"]["iata"], fa_airborne["origin"]["icao"]), "dest": None}, dest=(dest["iata"], dest["code"]), src="%s (DIVERTED)" % fa_airborne["provider"])
+        out["diverted"] = True
+        out["diverted_from"] = fa_airborne["filed_destination"]["iata"] or fa_airborne["filed_destination"]["icao"]
     landing_note, landing_apt, gap_note = None, None, None
     if not on_ground and not fresh and pts and fix["src"] == "adsb.lol trace":
         landing_apt, landing_note = _arrival_from_trace(pts, now, prefer=dest)
@@ -818,11 +964,18 @@ def locate(reg, lookback=7):
         ground_fresh = [f for f in fresh_fixes if f["alt"] == "ground" or (isinstance(f["alt"], (int, float)) and f["alt"] - elev <= 1500)]
         if len(ground_fresh) > 1 and agree:
             corr = "%d independent live sources" % len(ground_fresh)
+        fr_ground = next((f for f in ground_fresh if f["src"] == "Flightradar24 live"), None)
+        if not corr and fr_ground and agree:
+            corr = "Flightradar24 live position on the ground at %s (%s)" % (a["iata"] or a["code"], _fmt_z(fr_ground["t"]))
+            if fa_landed and airport_by_codes(fa_landed["destination"]["iata"], fa_landed["destination"]["icao"]) and airport_by_codes(fa_landed["destination"]["iata"], fa_landed["destination"]["icao"])["code"] == a["code"]:
+                corr += "; landing of %s recorded %s" % (fa_landed["ident"], _fmt_z(fa_landed["on"]))
         if not corr and fix.get("record"):
             rec = fix["record"]
-            corr = "FlightAware recorded %s landing at %s %s%s" % (rec["ident"], a["iata"] or a["code"], _fmt_z(rec["on"]), " (DIVERTED from %s)" % (rec["destination"]["iata"]) if rec["diverted"] else "")
-        if not corr and fa_landed and airport_by_codes(fa_landed["destination"]["iata"], fa_landed["destination"]["icao"]) is a:
-            corr = "FlightAware recorded %s landing here %s" % (fa_landed["ident"], _fmt_z(fa_landed["on"]))
+            corr = "%s recorded %s landing at %s %s%s" % (rec["provider"], rec["ident"], a["iata"] or a["code"], _fmt_z(rec["on"]), " (DIVERTED - filed %s)" % (rec["filed_destination"]["iata"] or rec["filed_destination"]["icao"]) if rec["diverted"] else "")
+        if not corr and fa_landed:
+            fa_apt = airport_by_codes(fa_landed["destination"]["iata"], fa_landed["destination"]["icao"])
+            if fa_apt and fa_apt["code"] == a["code"]:
+                corr = "%s recorded %s landing here %s" % (fa_landed["provider"], fa_landed["ident"], _fmt_z(fa_landed["on"]))
         if not corr and pts:
             n, span = _ground_dwell(pts, a)
             if n >= 3 and span >= 120:
@@ -832,10 +985,11 @@ def locate(reg, lookback=7):
         check("Corroborated", bool(corr), corr or why)
         if fa_flights is not None and fa_landed:
             later = [f for f in fa_flights if f["off"] and f["off"] > fa_landed["on"]]
-            check("No later departure", not later, "FlightAware shows no departure after that landing" if not later else "FlightAware shows %s departed %s afterwards" % (later[0]["ident"], _fmt_z(later[0]["off"])))
+            check("No later departure", not later, "%s shows no departure after that landing" % prov if not later else "%s shows %s departed %s afterwards" % (prov, later[0]["ident"], _fmt_z(later[0]["off"])))
         check("Recent enough", age <= 3 * 86400, "fix %s old" % _fmt_age(age) + ("" if age <= 3 * 86400 else " - confirm manually"))
-        if fix.get("record") and fix["record"]["diverted"]:
+        if (fix.get("record") and fix["record"]["diverted"]) or (fa_landed and fa_landed["diverted"] and airport_by_codes(fa_landed["destination"]["iata"], fa_landed["destination"]["icao"]) and airport_by_codes(fa_landed["destination"]["iata"], fa_landed["destination"]["icao"])["code"] == a["code"]):
             out["diverted"] = True
+            out["diverted_from"] = (fa_landed or fix["record"])["filed_destination"]["iata"] or (fa_landed or fix["record"])["filed_destination"]["icao"]
         out["status"] = "ground" if inside else "ground_off_airport"
         out["confidence"] = ("high" if (inside and age < 3 * 86400) else "low") if not gap_note else "medium"
         line = airport_line(a) if inside else "%s (nearest airport, %.0f nm away, position is off-airport)" % (airport_line(a), a["dist"] / 1.852)
@@ -847,6 +1001,11 @@ def locate(reg, lookback=7):
             out["arrival_inferred"] = True
     else:
         dep_trace, dep_how = _departure_from_trace(pts, prefer=route_orig) if pts else (None, "no trace")
+        # the provider's take-off record for the flight in progress is an observed departure too
+        if fa_airborne and fa_airborne["off"] and (now - fa_airborne["off"]) < 20 * 3600:
+            rec_orig = airport_by_codes(fa_airborne["origin"]["iata"], fa_airborne["origin"]["icao"])
+            if rec_orig and (dep_trace is None or dep_trace["code"] == rec_orig["code"]):
+                dep_trace, dep_how = rec_orig, "%s recorded %s taking off from %s %s" % (fa_airborne["provider"], fa_airborne["ident"], rec_orig["iata"] or rec_orig["code"], _fmt_z(fa_airborne["off"]))
         dep_trace_inside = dep_trace is not None
         dep = dep_trace or route_orig
         # A track lost at cruise, pointed at a known destination that it cannot have reached yet, is still airborne
@@ -859,7 +1018,8 @@ def locate(reg, lookback=7):
                 still_air = "track lost %s ago%s at %d ft, %d kt, %.0f nm from %s on track %d (bearing %d); cannot arrive before %s" % (
                     _fmt_age(age), (" near %s" % (n0["iata"] or n0["code"])) if n0 and n0["dist"] < 300 else "", fix["alt"], fix["gs"], d_km / 1.852, dest["iata"] or dest["code"], fix["track"], brg, _fmt_z(earliest))
         check("Fresh in-flight fix", fresh or bool(still_air), ("%s old" % _fmt_age(age)) if fresh else (still_air or "track lost %s ago" % _fmt_age(age)))
-        check("Destination known", bool(dest), ("%s usual route for %s (%s)" % (dest["iata"] or dest["code"], cs, route["src"])) if dest else "no destination from any source")
+        dest_basis = ("filed destination for %s (%s)" % (cs, route["src"])) if (route and route["src"].startswith("Flightradar24")) else ("usual route for callsign %s (%s)" % (cs, route["src"])) if route else ""
+        check("Destination known", bool(dest), ("%s - %s" % (dest["iata"] or dest["code"], dest_basis)) if dest else "no destination from any source")
         # departure never received (sparse coverage at the origin) but the aircraft sits on the great circle from the
         # route's origin to its destination, short of the destination: the route database origin is geometrically consistent
         geo_ok = None
@@ -874,7 +1034,7 @@ def locate(reg, lookback=7):
                     route_orig["iata"] or route_orig["code"], d_of / 1.852, route_orig["iata"] or route_orig["code"], dest["iata"] or dest["code"], dest["iata"] or dest["code"])
         check("Departure observed", dep_trace_inside or bool(geo_ok), dep_how if dep_trace_inside else geo_ok if geo_ok else (("%s only from the route database (%s)" % (route_orig["iata"] or route_orig["code"], dep_how)) if route_orig else "departure airport unknown (%s)" % dep_how))
         route_ok = not (route_orig and dep_trace_inside) or route_orig["code"] == dep_trace["code"]
-        check("Route consistent", route_ok, ("route origin %s matches observed departure" % (route_orig["iata"] or route_orig["code"])) if (route_orig and dep_trace_inside and route_ok) else "nothing contradicts the route" if route_ok else "route database says %s but the aircraft departed %s - callsign may be reused" % (route_orig["iata"] or route_orig["code"], dep_trace["iata"] or dep_trace["code"]))
+        check("Route consistent", route_ok, ("route origin %s matches observed departure" % (route_orig["iata"] or route_orig["code"])) if (route_orig and dep_trace_inside and route_ok) else "nothing contradicts the route" if route_ok else "%s says %s but the aircraft departed %s%s" % ("Flightradar24" if (route and route["src"].startswith("Flightradar24")) else "route database", route_orig["iata"] or route_orig["code"], dep_trace["iata"] or dep_trace["code"], "" if (route and route["src"].startswith("Flightradar24")) else " - callsign may be reused"))
         if dest:
             brg = _bearing(fix["lat"], fix["lon"], dest["lat"], dest["lon"])
             d = hav(fix["lat"], fix["lon"], dest["lat"], dest["lon"])
@@ -885,7 +1045,7 @@ def locate(reg, lookback=7):
         if still_air:
             out["still_airborne_inferred"] = True
         if dest:
-            out["airport"] = {"iata": dest["iata"], "icao": dest["code"], "name": dest["name"], "country": country_name(dest["country"]), "basis": "usual route for callsign %s (%s)" % (cs, route["src"])}
+            out["airport"] = {"iata": dest["iata"], "icao": dest["code"], "name": dest["name"], "country": country_name(dest["country"]), "basis": dest_basis}
         if dep:
             out["from"] = {"iata": dep["iata"], "icao": dep["code"], "name": dep["name"], "country": country_name(dep["country"])}
         if n0:
@@ -906,19 +1066,22 @@ def locate(reg, lookback=7):
     return out
 
 
-def _locate_airborne_record(out, canon, rec, fa_flights, now, lookback, check):
-    """In flight according to FlightAware's departure record, with no usable live position."""
+def _locate_airborne_record(out, canon, rec, fa_flights, now, lookback, check, prov="FlightAware"):
+    """In flight according to the provider's departure record, with no usable live position."""
     dest = airport_by_codes(rec["destination"]["iata"], rec["destination"]["icao"])
     orig = airport_by_codes(rec["origin"]["iata"], rec["origin"]["icao"])
-    check("Identity", not rec["reg"] or reg_key(rec["reg"]) == reg_key(canon), "FlightAware record names %s" % (rec["reg"] or canon))
-    check("Departure recorded", bool(rec["off"] and orig), "FlightAware: %s departed %s %s" % (rec["ident"], orig["iata"] if orig else "?", _fmt_z(rec["off"])) if rec["off"] else "no departure time")
-    check("Destination filed", bool(dest), ("%s%s" % (dest["iata"] or dest["code"], " (diverted)" if rec["diverted"] else "")) if dest else "destination unknown")
+    check("Identity", not rec["reg"] or reg_key(rec["reg"]) == reg_key(canon), "%s record names %s" % (prov, rec["reg"] or canon))
+    check("Departure recorded", bool(rec["off"] and orig), "%s: %s departed %s %s" % (prov, rec["ident"], orig["iata"] if orig else "?", _fmt_z(rec["off"])) if rec["off"] else "no departure time")
+    check("Destination filed", bool(dest), ("%s%s" % (dest["iata"] or dest["code"], " (DIVERTED - filed %s)" % (rec["filed_destination"]["iata"] or rec["filed_destination"]["icao"]) if rec["diverted"] else "")) if dest else "destination unknown")
+    if rec["diverted"]:
+        out["diverted"] = True
+        out["diverted_from"] = rec["filed_destination"]["iata"] or rec["filed_destination"]["icao"]
     check("Still airborne", (now - rec["off"]) < 20 * 3600, "departed %s ago, no arrival recorded yet" % _fmt_age(now - rec["off"]) if (now - rec["off"]) < 20 * 3600 else "departed %s ago with no arrival recorded - record is stale" % _fmt_age(now - rec["off"]))
     out["status"] = "enroute"
     out["confidence"] = "high" if dest and orig else "medium"
-    out["fix"] = {"source": "FlightAware record", "time_utc": datetime.fromtimestamp(rec["off"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "age_s": int(now - rec["off"]), "callsign": rec["ident"], "progress_percent": rec["progress"]}
+    out["fix"] = {"source": "%s record" % prov, "time_utc": datetime.fromtimestamp(rec["off"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "age_s": int(now - rec["off"]), "callsign": rec["ident"], "progress_percent": rec["progress"]}
     if dest:
-        out["airport"] = {"iata": dest["iata"], "icao": dest["code"], "name": dest["name"], "country": country_name(dest["country"]), "basis": "FlightAware filed destination" + (" (diverted)" if rec["diverted"] else "")}
+        out["airport"] = {"iata": dest["iata"], "icao": dest["code"], "name": dest["name"], "country": country_name(dest["country"]), "basis": "%s filed destination" % prov + (" (diverted)" if rec["diverted"] else "")}
     if orig:
         out["from"] = {"iata": orig["iata"], "icao": orig["code"], "name": orig["name"], "country": country_name(orig["country"])}
     if rec["diverted"]:
@@ -962,7 +1125,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_OPTIONS(self):
-        self._send(204, b"", extra={"Access-Control-Allow-Methods": "GET,OPTIONS", "Access-Control-Allow-Headers": "*", "Access-Control-Max-Age": "86400"})
+        self._send(204, b"", extra={"Access-Control-Allow-Methods": "GET,OPTIONS", "Access-Control-Allow-Headers": "*, X-FR24-Key", "Access-Control-Max-Age": "86400"})
 
     def do_HEAD(self):
         self.do_GET()
@@ -970,10 +1133,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         u = urllib.parse.urlsplit(self.path)
         q = urllib.parse.parse_qs(u.query)
+        # a Flightradar24 token entered in the page's Settings travels with each request and is used only when the server has none
+        _REQ.fr24_key = (self.headers.get("X-FR24-Key") or q.get("fr24_key", [""])[0] or "").strip()
         if u.path in ("/", "/index.html"):
             return self.serve_html()
         if u.path == "/ping":
-            return self._send(200, json.dumps({"ok": True, "relay": "local", "version": "2.6", "locate": "/locate?reg=EI-DEI", "flightaware": bool(aeroapi_key())}))
+            return self._send(200, json.dumps({"ok": True, "relay": "local", "version": "2.7", "locate": "/locate?reg=EI-DEI", "flightaware": bool(aeroapi_key()), "fr24": bool(fr24_key()), "fr24_server_key": bool(os.environ.get("FR24_KEY") or os.environ.get("FR24_API_KEY") or os.path.exists(os.path.join(HERE, "fr24.key")))}))
         if u.path == "/relay":
             return self.relay(q.get("url", [""])[0])
         if u.path == "/locate":
@@ -1063,7 +1228,7 @@ def main():
     print("  page:    %s" % url)
     print("  locate:  %slocate?reg=EI-DEI   (JSON; add &format=text for the bare line)" % url)
     print("  relay:   %srelay?url=...   allowed: %s" % (url, ", ".join(sorted(ALLOW))))
-    print("  airports: %d loaded   FlightAware key: %s   stop: Ctrl+C" % (len(airports()), "set" if aeroapi_key() else "not set (AEROAPI_KEY)"))
+    print("  airports: %d loaded   Flightradar24 key: %s   FlightAware key: %s   stop: Ctrl+C" % (len(airports()), "set" if fr24_key() else "not set (FR24_KEY env or fr24.key file)", "set" if aeroapi_key() else "not set (AEROAPI_KEY)"))
     if not args.no_browser and not hosted:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:

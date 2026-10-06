@@ -90,6 +90,7 @@
   .badge.warn,.status.stale{background:var(--amber-bg);color:var(--amber);border:1px solid var(--amber-bd)}
   .badge.info,.status.air{background:var(--blue-bg);color:var(--blue);border:1px solid var(--blue-bd)}
   .status.none{background:var(--soft);color:var(--muted);border:1px solid var(--border)}
+  .status.diverted{background:var(--red-bg,#fde8e8);color:var(--red,#b42318);border:1px solid var(--red-bd,#f3b8b8);font-weight:700}
   .status{display:inline-block;font-size:11.5px;font-weight:700;padding:3px 10px;border-radius:4px;letter-spacing:.5px;text-transform:uppercase;white-space:nowrap}
   .flag{display:inline-block;font-size:12px;padding:2px 8px;border-radius:4px;border:1px solid var(--border);background:var(--soft);color:var(--ink)}
   .flag.bad{background:var(--red-bg);border-color:var(--red-bd);color:var(--red)}
@@ -217,7 +218,7 @@
       <span class="dot off" id="dotFr24">FR24 off</span>
     </span>
     <span class="utc"><span id="utcClock">--:--:--</span>Z</span>
-    <span class="ver">v2.6</span>
+    <span class="ver">v2.7</span>
   </div>
 </header>
 
@@ -276,8 +277,8 @@
       <h3 class="sec">Pipeline</h3>
       <div class="flow">
         <div><b>1 · Identity</b>Registration → Mode S hex, type, operator (adsbdb.com, fallback hexdb.io).</div>
-        <div><b>2 · Live position</b>adsb.lol, airplanes.live, adsb.fi by registration and by hex; OpenSky by hex. All queried, every time.</div>
-        <div><b>3 · History</b>adsb.lol per-aircraft trace: today's rolling file, then the daily archive back up to 14 days.</div>
+        <div><b>2 · Live position</b>adsb.lol, airplanes.live, adsb.fi by registration and by hex; OpenSky by hex; <b>Flightradar24 live (when a key is set)</b>. All queried, every time, and cross-checked against each other.</div>
+        <div><b>3 · History</b><b>Flightradar24 flight summary (when a key is set)</b>: take-off and landing times, filed and <i>actual</i> destination for every flight in the look-back window. Plus the adsb.lol per-aircraft trace: today's rolling file, then the daily archive back up to 14 days.</div>
         <div><b>4 · Airport match</b>Freshest fix → nearest airport from the embedded OurAirports database, runway-derived boundary.</div>
         <div><b>5 · Verification</b>Seven checks on the ground, seven in flight. All must pass or the line is withheld.</div>
         <div><b>6 · Output</b><span class="mono">CODE - Airport - Country</span>, or <span class="mono">Currently en route to … from …</span>, or <span class="mono">UNVERIFIED - manual check required - reason</span>.</div>
@@ -298,7 +299,7 @@
           <tr><td>OurAirports</td><td class="mono">embedded (airports.json / window.AIRPORTS)</td><td>9,765 airports: ICAO, IATA, position, name, city, country, size, field elevation, boundary radius computed from runway-end coordinates (+1.5 km, floor 1.5–3.5 km by size)</td><td>Nearest-airport match; "inside boundary" test; IATA code and country name for the output line</td><td>Public domain. Large and medium airports, plus small ones with an IATA code or scheduled service; heliports and closed fields excluded</td></tr>
           <tr><td>planespotters.net</td><td class="mono">api.planespotters.net/pub/photos/reg/{reg}</td><td>Photo thumbnail with photographer credit</td><td>Full detail tab only</td><td>Free, direct, credit required</td></tr>
           <tr><td>FlightAware AeroAPI (server-side, free Personal tier)</td><td class="mono">aeroapi.flightaware.com/aeroapi/flights/{reg}</td><td>Recent flights for the registration: ident, origin, destination, actual departure and arrival times, diverted / cancelled flags, progress</td><td>Authoritative departure and landing events — used when the community feeds have no coverage (mainland China, parts of Africa, Central Asia, oceanic) or lost the track on final approach. A recorded landing newer than the last fix wins. Called by the server only; the key is an environment variable (<span class="mono">AEROAPI_KEY</span>), never in the browser</td><td>Free Personal tier ($5/month usage credit, ~1,000 lookups; non-commercial; 10 result sets/min). Without a key this source is skipped</td></tr>
-          <tr><td>Flightradar24 API (optional)</td><td class="mono">fr24api.flightradar24.com/api/live/flight-positions/full<br>…/api/flight-summary/full</td><td>Live position with filed origin/destination and ETA; flight history with recorded actual arrival airport</td><td>Only when a subscriber key is entered; filed route and landing record then join the verification</td><td>Paid (Explorer $9/month, 30,000 credits). Not used by default</td></tr>
+          <tr><td><b>Flightradar24 API — primary source when a key is present</b></td><td class="mono">fr24api.flightradar24.com/api/live/flight-positions/full?registrations=<br>…/api/flight-summary/full?registrations=&amp;flight_datetime_from=&amp;flight_datetime_to=&amp;sort=desc<br>…/api/usage (key test)<br>headers: Accept-Version: v1 · Authorization: Bearer &lt;token&gt;</td><td>Live: position, altitude, speed, track, callsign, hex, <b>filed origin and destination</b>, ETA, data source (ADS-B / MLAT / satellite / estimated). Summary: per flight — <span class="mono">datetime_takeoff</span>, <span class="mono">datetime_landed</span>, <span class="mono">orig_iata</span>, <span class="mono">dest_iata</span>, <b><span class="mono">dest_iata_actual</span></b> (where it really landed), <span class="mono">flight_ended</span></td><td>Called by the server engine on every lookup. Live position joins the "Sources agree" cross-check and, on the ground, is corroboration in itself. The filed destination replaces the community route database. A landing record newer than any free-feed fix wins (covers Russia, China, oceans). <span class="mono">dest_iata_actual ≠ dest_iata</span> is the only thing the tool calls a <b>DIVERTED</b> flight. A later take-off in the summary means the aircraft is airborne again. Free feeds still run and must agree — a contradiction fails the lookup</td><td>Subscriber key. Set once on the server (<span class="mono">FR24_KEY</span> environment variable on Render, or a <span class="mono">fr24.key</span> file beside tail_locator.py), or enter it in Settings — the page then sends it with each lookup. About 10–30 credits per lookup. HTTP 401 = key rejected, 402 = credits exhausted, 429 = rate limited; each is logged and the engine falls back to free data for that lookup</td></tr>
         </tbody>
       </table></div>
 
@@ -387,9 +388,10 @@
         <p class="note">Nothing leaves this browser except the API calls themselves. Settings and the last 12 lookups are kept in this browser's local storage.</p>
       </div>
       <div class="group">
-        <h3>Flightradar24 API <span class="flag warn">optional · paid</span> <span class="flag good" id="fr24Badge" hidden>active</span></h3>
-        <p>Not required. A subscriber key adds FR24's filed routes and its flight history with the recorded actual arrival airport, which then take part in verification. Explorer plan is $9/month for 30,000 credits; a lookup costs about 8–30. Leave empty to stay on free data.</p>
-        <label>API key (stored only in this browser)<input type="password" id="fr24Key" placeholder="Bearer token from Key management" autocomplete="off"></label>
+        <h3>Flightradar24 API <span class="flag good">primary source when set</span> <span class="flag good" id="fr24Badge" hidden>active</span></h3>
+        <p id="fr24ServerState">Checking the server…</p>
+        <p>With a key, every lookup gets Flightradar24's live position, filed destination and the recorded actual landing airport (so diversions are called correctly), and the free feeds become the cross-check. Without one the engine runs on free data only. Get a token at <span class="mono">fr24api.flightradar24.com</span> → Key management; a lookup costs roughly 10–30 credits.</p>
+        <label>API token (stored only in this browser; sent to the server with each lookup)<input type="password" id="fr24Key" placeholder="Bearer token from Key management" autocomplete="off"></label>
         <div class="row"><label class="inline"><input type="checkbox" id="fr24Sandbox"> sandbox key (static test data)</label></div>
         <div class="row">
           <button class="btn small" type="button" id="fr24Test">Test key</button>
@@ -403,7 +405,7 @@
 
 </main>
 <footer>
-  Data: adsb.lol · airplanes.live · adsb.fi · OpenSky Network · adsbdb.com · hexdb.io · planespotters.net · OurAirports · Map © OpenStreetMap contributors, © CARTO. Flightradar24 API only when a subscriber key is entered.<br>
+  Data: adsb.lol · airplanes.live · adsb.fi · OpenSky Network · adsbdb.com · hexdb.io · planespotters.net · OurAirports · Map © OpenStreetMap contributors, © CARTO. Flightradar24 API as the primary source when a subscriber key is entered.<br>
   Positions are surveillance data and can be wrong; confirm with the operator before dispatching anyone.
 </footer>
 
@@ -536,7 +538,7 @@ function relayUrl(target) {
 }
 async function detectLocalRelay() {
   if (!/^https?:$/.test(location.protocol)) return false;
-  try { const j = await getJSON(location.origin + '/ping', {}, 3000); if (j && j.relay === 'local') { state.localRelay = location.origin + '/relay'; state.serverLocate = location.origin + '/locate'; state.flightaware = !!j.flightaware; return true; } } catch {}
+  try { const j = await getJSON(location.origin + '/ping', {}, 3000); if (j && j.relay === 'local') { state.localRelay = location.origin + '/relay'; state.serverLocate = location.origin + '/locate'; state.flightaware = !!j.flightaware; state.fr24Server = !!j.fr24; state.fr24ServerKey = !!j.fr24_server_key; return true; } } catch {}
   return false;
 }
 
@@ -1139,7 +1141,8 @@ function renderSimple(items) {
     <span class="badge-lg">${v.verified ? 'VERIFIED' : 'UNVERIFIED'}</span>
     <span class="reg">${esc(it.reg)}</span>
     <span class="status ${esc(v.cls)}">${esc(v.label)}</span>
-    <span class="meta">${esc(age)} · ${passed}/${total} checks passed · ${CONF_TEXT[v.conf].toLowerCase()}</span>
+    ${it.diverted ? `<span class="status diverted">DIVERTED${it.divertedFrom ? ' · filed ' + esc(it.divertedFrom) : ''}</span>` : ''}
+    <span class="meta">${esc(age)} · ${passed}/${total} checks passed · ${CONF_TEXT[v.conf].toLowerCase()}${it.provider ? ' · ' + esc(it.provider) : ''}</span>
   </div>
   <div class="line-row"><input class="line ${v.verified ? '' : 'none'}" id="line-${i}" readonly value="${esc(text)}" aria-label="Location line for ${esc(it.reg)}"><button class="btn copy" type="button" data-copy="${i}">Copy</button></div>
   ${guess}
@@ -1179,8 +1182,10 @@ fillAircraftLocation('EI-DEI');
 const STATUS_LABEL = { ground: 'On ground', ground_off_airport: 'On ground · off-airport', enroute: 'In flight', enroute_stale: 'Last seen in flight', unknown: 'No position data' };
 const STATUS_CLS = { ground: 'ground', ground_off_airport: 'stale', enroute: 'air', enroute_stale: 'stale', unknown: 'none' };
 async function serverLocate(regs) {
-  const j = await getJSON(`${state.serverLocate}?reg=${encodeURIComponent(regs.join(','))}&days=${settings.lookback}`, {}, 180000);
-  return (j.results || []).map(r => ({ reg: r.reg, line: r.text, live: r.fix && typeof r.fix.age_s === 'number' ? { lat: r.fix.lat, t: Date.now() - r.fix.age_s * 1000, src: r.fix.source } : null,
+  // the Flightradar24 token from Settings rides along so the server engine can use it when it has no key of its own
+  const hdr = settings.fr24Key ? { headers: { 'X-FR24-Key': settings.fr24Key } } : {};
+  const j = await getJSON(`${state.serverLocate}?reg=${encodeURIComponent(regs.join(','))}&days=${settings.lookback}`, hdr, 180000);
+  return (j.results || []).map(r => ({ reg: r.reg, line: r.text, provider: r.provider || '', diverted: !!r.diverted, divertedFrom: r.diverted_from || '', live: r.fix && typeof r.fix.age_s === 'number' ? { lat: r.fix.lat, t: Date.now() - r.fix.age_s * 1000, src: r.fix.source } : null,
     verdict: { verified: !!r.verified, checks: r.checks || [], cls: STATUS_CLS[r.status] || 'none', label: STATUS_LABEL[r.status] + (r.since_utc ? ' · since ' + fmtTime(Date.parse(r.since_utc)) : ''), conf: r.confidence === 'high' ? 'high' : r.confidence === 'medium' ? 'med' : 'low', mode: r.status.startsWith('ground') ? 'ground' : r.status.startsWith('enroute') ? 'air' : 'none', via: r.fix ? r.fix.source : '', whyNot: '' },
     best: r.best_guess, log: r.log || [] }));
 }
@@ -1272,7 +1277,7 @@ async function locate(text, { fromUser = true } = {}) {
     // 6) decide + render
     const serverItems = serverP ? await serverP : null;
     if (token !== runToken) return;
-    if (serverItems && serverItems.length) logAll('Lookup line taken from the server engine (/locate), which also consults FlightAware when a key is configured');
+    if (serverItems && serverItems.length) logAll('Lookup line taken from the server engine (/locate), which uses Flightradar24 as the primary source when a key is configured (FlightAware as fallback)');
     results.innerHTML = items.map((it, i) => { it.verdict = decide(it); verify(it, it.verdict); it.line = formatLine(it, it.verdict); return render(it, it.verdict, i); }).join('');
     items.forEach((it, i) => drawMap(i, it, it.verdict));
     if (serverItems && serverItems.length) { renderSimple(serverItems); postResults(serverItems); }
@@ -1309,11 +1314,13 @@ export default {
 function refreshSettingsUI() {
   const hasKey = !!settings.fr24Key, hasCloud = !!settings.cloudRelay, local = !!state.localRelay;
   const dotRelay = $('dotRelay'); dotRelay.className = 'dot ' + (local || hasCloud ? 'on' : 'off'); dotRelay.textContent = local ? 'Local relay' : hasCloud ? 'Cloud relay' : 'No relay';
-  $('dotFr24').className = 'dot ' + (hasKey ? 'on' : 'off'); $('dotFr24').textContent = hasKey ? (settings.sandbox ? 'FR24 sandbox' : 'FR24') : 'FR24 off';
+  const fr24On = hasKey || !!state.fr24Server;
+  $('dotFr24').className = 'dot ' + (fr24On ? 'on' : 'off'); $('dotFr24').textContent = fr24On ? (state.fr24ServerKey ? 'FR24 (server key)' : settings.sandbox ? 'FR24 sandbox' : 'FR24') : 'FR24 off';
+  const fs = $('fr24ServerState'); if (fs) fs.textContent = state.fr24ServerKey ? 'The server has its own Flightradar24 key (FR24_KEY) — every lookup already uses Flightradar24 as the primary source. A key entered below is only needed for the Full-detail view in this browser.' : state.localRelay ? 'The server has no Flightradar24 key. A token entered below is stored in this browser and sent with each lookup, so the server engine uses it too. To make it permanent for everyone, set FR24_KEY in the server environment (Render → Environment) or put it in a file named fr24.key next to tail_locator.py.' : 'Start the server (tail_locator.py) or open the hosted page; the token below is then sent with each lookup.';
   const fa = $('dotFA'); if (fa) { fa.className = 'dot ' + (state.flightaware ? 'on' : 'off'); fa.textContent = state.flightaware ? 'FlightAware' : 'FlightAware off'; }
   $('fr24Badge').hidden = !hasKey; $('relayBadge').hidden = !(local || hasCloud); $('relayBadge').textContent = local ? 'local relay connected' : 'cloud relay set';
   $('localState').textContent = local ? `Connected — this page is being served by tail_locator.py at ${location.origin}.` : (/^https?:$/.test(location.protocol) ? 'Not detected. Start tail_locator.py and open the address it prints (http://127.0.0.1:8765/).' : 'Not detected. You opened the HTML file directly; start tail_locator.py and use the address it prints instead, or set a cloud relay below.');
-  $('settingsSummary').textContent = `${local ? 'local relay' : hasCloud ? 'cloud relay' : 'no relay'} · ${settings.lookback}-day history · FR24 ${hasKey ? 'on' : 'off (optional)'}`;
+  $('settingsSummary').textContent = `${local ? 'local relay' : hasCloud ? 'cloud relay' : 'no relay'} · ${settings.lookback}-day history · Flightradar24 ${fr24On ? (state.fr24ServerKey ? 'on (server key)' : 'on') : 'off — free data only'}`;
   $('hintText').textContent = local || hasCloud ? 'Up to 15 registrations per lookup. Press Enter or wait for auto-locate.' : 'No relay yet: run tail_locator.py (free) and open the address it prints. Identity lookups still work without it.';
 }
 function initSettings() {
