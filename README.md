@@ -8,7 +8,17 @@ Currently en route to LHR - London Heathrow Airport - United Kingdom from DUB - 
 UNVERIFIED - manual check required - <reason>
 ```
 
-Free data only (adsb.lol, airplanes.live, adsb.fi, OpenSky, adsb.lol trace archive, adsbdb, hexdb, OurAirports). No API keys, no accounts. Flightradar24 API is optional.
+Sources: **Flightradar24 API as the primary source whenever a key is present** (live position, filed destination, recorded take-off / landing, actual landing airport for diversions), cross-checked against the free feeds (adsb.lol, airplanes.live, adsb.fi, OpenSky, adsb.lol trace archive, adsbdb, hexdb, OurAirports). Without a key the engine runs on free data only.
+
+## Flightradar24 key
+
+Any one of these, checked in this order:
+
+1. `FR24_KEY` environment variable (Render: Dashboard → tail-locator → Environment → Add → `FR24_KEY` → Save; Render redeploys itself).
+2. A file named `fr24.key` beside `tail_locator.py` containing just the token (for the laptop copy).
+3. The token field in the page's Settings tab — stored in that browser and sent with each lookup as `X-FR24-Key`; the server uses it only when it has no key of its own.
+
+`/ping` reports `"fr24": true` once a key is in use. Test the key from Settings → **Test key** (calls FR24 `/usage`). HTTP 401 = token rejected, 402 = credits exhausted, 429 = rate limited — each is logged per lookup and the engine falls back to free data for that lookup.
 
 ## Run
 

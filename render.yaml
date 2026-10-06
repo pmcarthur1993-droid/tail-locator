@@ -7,3 +7,8 @@ services:
     startCommand: "python dist/tail_locator.py --host 0.0.0.0 --no-browser"
     healthCheckPath: /ping
     autoDeploy: true
+    envVars:
+      - key: FR24_KEY          # Flightradar24 API token - primary source when set (Render dashboard → Environment)
+        sync: false
+      - key: AEROAPI_KEY       # FlightAware AeroAPI key - optional fallback
+        sync: false
