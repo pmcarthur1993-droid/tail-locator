@@ -860,7 +860,19 @@ def locate(reg, lookback=7):
                     _fmt_age(age), (" near %s" % (n0["iata"] or n0["code"])) if n0 and n0["dist"] < 300 else "", fix["alt"], fix["gs"], d_km / 1.852, dest["iata"] or dest["code"], fix["track"], brg, _fmt_z(earliest))
         check("Fresh in-flight fix", fresh or bool(still_air), ("%s old" % _fmt_age(age)) if fresh else (still_air or "track lost %s ago" % _fmt_age(age)))
         check("Destination known", bool(dest), ("%s usual route for %s (%s)" % (dest["iata"] or dest["code"], cs, route["src"])) if dest else "no destination from any source")
-        check("Departure observed", dep_trace_inside, dep_how if dep_trace_inside else (("%s only from the route database (%s)" % (route_orig["iata"] or route_orig["code"], dep_how)) if route_orig else "departure airport unknown (%s)" % dep_how))
+        # departure never received (sparse coverage at the origin) but the aircraft sits on the great circle from the
+        # route's origin to its destination, short of the destination: the route database origin is geometrically consistent
+        geo_ok = None
+        if not dep_trace_inside and route_orig and dest and fix.get("track") is not None and route_orig["code"] != dest["code"]:
+            d_od = hav(route_orig["lat"], route_orig["lon"], dest["lat"], dest["lon"])
+            d_of = hav(route_orig["lat"], route_orig["lon"], fix["lat"], fix["lon"])
+            b_od = _bearing(route_orig["lat"], route_orig["lon"], dest["lat"], dest["lon"])
+            b_of = _bearing(route_orig["lat"], route_orig["lon"], fix["lat"], fix["lon"])
+            b_fd = _bearing(fix["lat"], fix["lon"], dest["lat"], dest["lon"])
+            if 30 < d_of < d_od and _ang_diff(b_od, b_of) <= 25 and _ang_diff(fix["track"], b_fd) <= 30:
+                geo_ok = "%s from the route database, consistent with the position: %.0f nm along the %s-%s track, heading for %s" % (
+                    route_orig["iata"] or route_orig["code"], d_of / 1.852, route_orig["iata"] or route_orig["code"], dest["iata"] or dest["code"], dest["iata"] or dest["code"])
+        check("Departure observed", dep_trace_inside or bool(geo_ok), dep_how if dep_trace_inside else geo_ok if geo_ok else (("%s only from the route database (%s)" % (route_orig["iata"] or route_orig["code"], dep_how)) if route_orig else "departure airport unknown (%s)" % dep_how))
         route_ok = not (route_orig and dep_trace_inside) or route_orig["code"] == dep_trace["code"]
         check("Route consistent", route_ok, ("route origin %s matches observed departure" % (route_orig["iata"] or route_orig["code"])) if (route_orig and dep_trace_inside and route_ok) else "nothing contradicts the route" if route_ok else "route database says %s but the aircraft departed %s - callsign may be reused" % (route_orig["iata"] or route_orig["code"], dep_trace["iata"] or dep_trace["code"]))
         if dest:
@@ -869,7 +881,7 @@ def locate(reg, lookback=7):
             trk = fix.get("track")
             check("Heading toward destination", trk is None or d < 150 or _ang_diff(trk, brg) <= 90, ("track %d, destination bears %d, %.0f nm" % (trk, brg, d / 1.852)) if trk is not None else "no track reported")
         out["status"] = "enroute" if (fresh or still_air) else "enroute_stale"
-        out["confidence"] = ("high" if dest else "medium") if fresh else ("medium" if still_air else "low")
+        out["confidence"] = ("high" if (dest and not geo_ok) else "medium") if fresh else ("medium" if still_air else "low")
         if still_air:
             out["still_airborne_inferred"] = True
         if dest:
