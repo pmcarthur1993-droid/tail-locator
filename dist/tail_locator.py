@@ -471,7 +471,33 @@ def _legs(pts):
         cur.append(p)
     if cur:
         legs.append(cur)
-    return legs
+    # re-join legs that are one flight interrupted by a coverage gap (oceans, deserts, the far north):
+    # both sides at cruise, and the aircraft covered about the distance its speed and the gap predict
+    merged = []
+    for leg in legs:
+        if merged and _continuous(merged[-1], leg):
+            merged[-1] = merged[-1] + leg
+        else:
+            merged.append(leg)
+    return merged
+
+
+def _continuous(a, b):
+    p, q = a[-1], b[0]
+    gap = q["t"] - p["t"]
+    if gap > 4 * 3600 or not isinstance(p["alt"], (int, float)) or not isinstance(q["alt"], (int, float)) or p["alt"] < 10000 or q["alt"] < 10000:
+        return False
+    gs = p["gs"] if p["gs"] else q["gs"]
+    if not gs or gs < 250:
+        return False
+    expected = gs * 1.852 * gap / 3600.0
+    actual = hav(p["lat"], p["lon"], q["lat"], q["lon"])
+    if expected < 50 or not (0.6 * expected <= actual <= 1.3 * expected):
+        return False
+    cp, cq = _last_callsign(a), (next((x["callsign"] for x in b if x["callsign"]), "") or "")
+    if cp and cq and norm_callsign(cp) != norm_callsign(cq):
+        return False
+    return True
 
 
 def _terminal_candidates(p, leaving, prefer=None):
@@ -807,7 +833,16 @@ def locate(reg, lookback=7):
         dep_trace, dep_how = _departure_from_trace(pts, prefer=route_orig) if pts else (None, "no trace")
         dep_trace_inside = dep_trace is not None
         dep = dep_trace or route_orig
-        check("Fresh in-flight fix", fresh, "%s old" % _fmt_age(age) if fresh else "track lost %s ago" % _fmt_age(age))
+        # A track lost at cruise, pointed at a known destination that it cannot have reached yet, is still airborne
+        still_air = None
+        if not fresh and dest and dep_trace_inside and fix.get("track") is not None and isinstance(fix["alt"], (int, float)) and fix["alt"] >= 10000 and (fix["gs"] or 0) >= 250:
+            d_km = hav(fix["lat"], fix["lon"], dest["lat"], dest["lon"])
+            brg = _bearing(fix["lat"], fix["lon"], dest["lat"], dest["lon"])
+            earliest = fix["t"] + d_km / (fix["gs"] * 1.852 * 1.15) * 3600   # even 15% faster than observed, no sooner than this
+            if _ang_diff(fix["track"], brg) <= 30 and now < earliest - 10 * 60:
+                still_air = "track lost %s ago%s at %d ft, %d kt, %.0f nm from %s on track %d (bearing %d); cannot arrive before %s" % (
+                    _fmt_age(age), (" near %s" % (n0["iata"] or n0["code"])) if n0 and n0["dist"] < 300 else "", fix["alt"], fix["gs"], d_km / 1.852, dest["iata"] or dest["code"], fix["track"], brg, _fmt_z(earliest))
+        check("Fresh in-flight fix", fresh or bool(still_air), ("%s old" % _fmt_age(age)) if fresh else (still_air or "track lost %s ago" % _fmt_age(age)))
         check("Destination known", bool(dest), ("%s usual route for %s (%s)" % (dest["iata"] or dest["code"], cs, route["src"])) if dest else "no destination from any source")
         check("Departure observed", dep_trace_inside, dep_how if dep_trace_inside else (("%s only from the route database (%s)" % (route_orig["iata"] or route_orig["code"], dep_how)) if route_orig else "departure airport unknown (%s)" % dep_how))
         route_ok = not (route_orig and dep_trace_inside) or route_orig["code"] == dep_trace["code"]
@@ -817,8 +852,10 @@ def locate(reg, lookback=7):
             d = hav(fix["lat"], fix["lon"], dest["lat"], dest["lon"])
             trk = fix.get("track")
             check("Heading toward destination", trk is None or d < 150 or _ang_diff(trk, brg) <= 90, ("track %d, destination bears %d, %.0f nm" % (trk, brg, d / 1.852)) if trk is not None else "no track reported")
-        out["status"] = "enroute" if fresh else "enroute_stale"
-        out["confidence"] = ("high" if dest else "medium") if fresh else "low"
+        out["status"] = "enroute" if (fresh or still_air) else "enroute_stale"
+        out["confidence"] = ("high" if dest else "medium") if fresh else ("medium" if still_air else "low")
+        if still_air:
+            out["still_airborne_inferred"] = True
         if dest:
             out["airport"] = {"iata": dest["iata"], "icao": dest["code"], "name": dest["name"], "country": country_name(dest["country"]), "basis": "usual route for callsign %s (%s)" % (cs, route["src"])}
         if dep:
@@ -828,8 +865,10 @@ def locate(reg, lookback=7):
         to_txt = airport_line(dest) if dest else "destination not available (airborne near %s)" % (airport_line(n0) if n0 else "unknown position")
         from_txt = airport_line(dep) if dep else "departure airport not available"
         line = "Currently en route to %s from %s" % (to_txt, from_txt)
-        if not fresh:
+        if not fresh and not still_air:
             line += " (last seen %s, track lost)" % _fmt_z(fix["t"])
+        if not fresh:
+            out["since_utc"] = out["fix"]["time_utc"]
     out["verified"] = all(c["ok"] for c in checks)
     out["best_guess"] = line
     if out["verified"]:
@@ -906,7 +945,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path in ("/", "/index.html"):
             return self.serve_html()
         if u.path == "/ping":
-            return self._send(200, json.dumps({"ok": True, "relay": "local", "version": "2.5", "locate": "/locate?reg=EI-DEI", "flightaware": bool(aeroapi_key())}))
+            return self._send(200, json.dumps({"ok": True, "relay": "local", "version": "2.6", "locate": "/locate?reg=EI-DEI", "flightaware": bool(aeroapi_key())}))
         if u.path == "/relay":
             return self.relay(q.get("url", [""])[0])
         if u.path == "/locate":
