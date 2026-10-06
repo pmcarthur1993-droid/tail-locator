@@ -236,7 +236,7 @@ function legsFromPoints(pts) {
     if (p.callsign) callsign = p.callsign;
     const ground = isGroundPt(p);
     if (cur && (p.flags & 2) && cur.n > 2 && !ground) close(cur.last, 'lost');
-    if (!ground && !cur) cur = { start: p.t, dep: lastGround ? { lat: lastGround.lat, lon: lastGround.lon, t: lastGround.t } : { lat: p.lat, lon: p.lon, t: p.t, inferred: true }, callsign, maxAlt: 0, n: 0, squawk: '' };
+    if (!ground && !cur) { const lgOk = lastGround && (p.t - lastGround.t) <= 45 * 60000 && hav(p.lat, p.lon, lastGround.lat, lastGround.lon) <= 60; cur = { start: p.t, dep: lgOk ? { lat: lastGround.lat, lon: lastGround.lon, t: lastGround.t } : { lat: p.lat, lon: p.lon, t: p.t, inferred: true, alt: p.alt }, callsign, maxAlt: 0, n: 0, squawk: '' }; }
     if (cur) { cur.n++; if (typeof p.alt === 'number') cur.maxAlt = Math.max(cur.maxAlt, p.alt); if (p.callsign) cur.callsign = p.callsign; if (p.squawk) cur.squawk = p.squawk; cur.last = p; }
     if (ground && cur) close(p, 'landed');
     if (ground) lastGround = p;
@@ -244,7 +244,8 @@ function legsFromPoints(pts) {
   if (cur) close(cur.last, 'inprogress');
   return legs.filter(l => (l.end - l.start) > 180000 || l.maxAlt > 1500).map(l => {
     const d = aptAt(l.dep.lat, l.dep.lon), a = l.arr ? aptAt(l.arr.lat, l.arr.lon) : { apt: null, inside: false };
-    return { ...l, depApt: d.apt, depInside: d.inside, arrApt: a.apt, arrInside: a.inside };
+    const depOk = l.dep.inferred ? (d.apt && d.apt.dist <= 15 && (typeof l.dep.alt !== 'number' || l.dep.alt - (d.apt.elev || 0) <= 5000)) : (d.apt && d.apt.dist <= d.apt.radius + 3);
+    return { ...l, depApt: depOk ? d.apt : null, depInside: !!depOk, arrApt: a.apt, arrInside: a.inside };
   });
 }
 function lastPointAsFix(tr) {
@@ -357,14 +358,18 @@ function decide(res) {
     const age = Math.max(0, (now - live.t) / 1000);
     const near = nearestAirports(live.lat, live.lon, 3); const n0 = near[0] || null; v.nearest = near;
     const elev = n0 && n0.elev != null ? n0.elev : 0;
-    const onGround = live.alt === 'ground' || (typeof live.alt === 'number' && (live.gs == null || live.gs <= 60) && (live.alt - elev) <= 1500 && (live.vs == null || Math.abs(live.vs) < 300));
+    let onGround = live.alt === 'ground' || (typeof live.alt === 'number' && (live.gs == null || live.gs <= 60) && (live.alt - elev) <= 1500 && (live.vs == null || Math.abs(live.vs) < 300));
     const fresh = age <= FRESH_S;
+    let landingNote = null;
+    if (!onGround && !fresh && n0) { landingNote = landingInferred(live, n0, age); if (landingNote) onGround = true; }
+    v.landingNote = landingNote;
     const fixLine = `${live.src} fix ${fmtAge(age)} old at ${live.lat.toFixed(4)}, ${live.lon.toFixed(4)}${live.alt === 'ground' ? ', on-ground flag set' : (typeof live.alt === 'number' ? `, ${fmtInt(live.alt)} ft` : '')}${live.gs != null ? `, ${fmtInt(live.gs)} kt` : ''}${live.source ? ` (${live.source})` : ''}.`;
     v.via = live.src;
     if (onGround) {
       v.mode = 'ground';
-      if (n0 && n0.dist <= n0.radius) {
+      if (n0 && (n0.dist <= n0.radius || landingNote)) {
         v.airport = n0; v.dist = n0.dist;
+        if (landingNote) v.evidence.push('Landing inferred: ' + landingNote);
         if (fresh) { v.cls = 'ground'; v.label = 'On ground'; v.conf = 'high'; }
         else if (age < 3 * 86400) { v.cls = 'ground'; v.label = `On ground · since ${fmtTime(live.t)}`; v.conf = 'high'; }
         else { v.cls = 'stale'; v.label = `Last seen on ground · ${fmtTime(live.t)}`; v.conf = 'med'; }
@@ -439,6 +444,18 @@ function decide(res) {
   return v;
 }
 function angDiff(a, b) { let d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; }
+/* Last position was on final approach and nothing followed: the aircraft landed there. */
+function landingInferred(fix, n0, age) {
+  if (!n0 || age < 600) return null;
+  const elev = n0.elev || 0;
+  const agl = typeof fix.alt === 'number' ? fix.alt - elev : (fix.alt === 'ground' ? 0 : null);
+  if (agl == null || agl > 2500) return null;
+  if (fix.gs != null && fix.gs > 200) return null;
+  if (fix.vs != null && fix.vs > 300) return null;
+  if (n0.dist > 10) return null;
+  if (n0.dist > 5 && fix.track != null && angDiff(fix.track, bearing(fix.lat, fix.lon, n0.lat, n0.lon)) > 45) return null;
+  return `last fix ${fmtTime(fix.t)} at ${fmtInt(agl)} ft above the field, ${fix.gs != null ? fmtInt(fix.gs) : '?'} kt, ${fmtDist(n0.dist)} from ${n0.iata || n0.code}, ${(fix.vs || 0) < -100 ? 'descending' : 'level'}; no transmission since — landed`;
+}
 function bestGuessLine(res, v) { const saved = v.checks; v.checks = null; const t = formatLine(res, v); v.checks = saved; return t; }
 function fromAirport(res) {
   const live = res.live, leg = res.legs && res.legs[0];
@@ -481,16 +498,16 @@ function verify(res, v) {
   ok('Sources agree', agree, agreeDetail);
   if (v.mode === 'ground') {
     const a = v.airport;
-    const inside = a && !a.unknown && v.dist != null && v.dist <= a.radius;
+    const inside = a && !a.unknown && v.dist != null && (v.dist <= a.radius || !!v.landingNote);
     // 4. geometry: inside one airport boundary, unambiguous
     const others = (v.nearest || []).slice(1).filter(n => n.dist <= n.radius && sizeRank(n) >= sizeRank(a));
     ok('Inside airport boundary', inside && others.length === 0, !a ? 'no airport near the fix' : !inside ? `${fmtDist(v.dist)} from ${a.iata || a.code}, outside its ${fmtDist(a.radius)} boundary` : others.length ? `also inside ${others[0].iata || others[0].code} — ambiguous` : `${fmtDist(v.dist)} from ${a.iata || a.code} reference, within ${fmtDist(a.radius)}`);
     // 5. ground state plausible
     const elev = a && a.elev != null ? a.elev : 0;
-    const grounded = live.alt === 'ground' || (typeof live.alt === 'number' && live.alt - elev <= 1500 && (live.gs == null || live.gs <= 60));
-    ok('On-ground state', grounded, live.alt === 'ground' ? 'ground flag set by transponder' : `${fmtInt(live.alt)} ft, ${live.gs != null ? fmtInt(live.gs) + ' kt' : 'speed n/a'}`);
-    // 6. corroboration: a second source, a trace dwell, or FR24's landing record
-    let corr = '', why = 'single fix with nothing to corroborate it';
+    const grounded = !!v.landingNote || live.alt === 'ground' || (typeof live.alt === 'number' && live.alt - elev <= 1500 && (live.gs == null || live.gs <= 60));
+    ok('On-ground state', grounded, live.alt === 'ground' ? 'ground flag set by transponder' : v.landingNote ? 'landing inferred from final approach' : `${fmtInt(live.alt)} ft, ${live.gs != null ? fmtInt(live.gs) + ' kt' : 'speed n/a'}`);
+    // 6. corroboration: a second source, a trace dwell, FR24's landing record, or an unambiguous final approach
+    let corr = v.landingNote ? 'Landing inferred: ' + v.landingNote : '', why = 'single fix with nothing to corroborate it';
     if (freshFixes.length > 1 && agree && freshFixes.every(f => f.alt === 'ground' || (typeof f.alt === 'number' && f.alt - elev <= 1500))) corr = `${freshFixes.length} independent live sources`;
     if (!corr && res.tracePts && a) {
       let n = 0, first = null, last = null;
@@ -525,7 +542,7 @@ function formatLine(res, v) {
   if (v.checks && !v.verified) return `UNVERIFIED - manual check required - ${v.whyNot}`;
   const live = res.live;
   if (v.mode === 'ground' && v.airport) {
-    const inside = v.dist == null || v.airport.unknown || v.dist <= (v.airport.radius || 0);
+    const inside = v.dist == null || v.airport.unknown || v.dist <= (v.airport.radius || 0) || !!v.landingNote;
     return inside ? airportLine(v.airport) : `${airportLine(v.airport)} (nearest airport, ${fmtDist(v.dist)} away, position is off-airport)`;
   }
   if (v.mode === 'air') {
