@@ -479,6 +479,15 @@ def _legs(pts):
             merged[-1] = merged[-1] + leg
         else:
             merged.append(leg)
+    # position-only points carry no velocity: carry speed/track/climb forward from the previous few minutes
+    for leg in merged:
+        prev = None
+        for p in leg:
+            if prev and p["t"] - prev["t"] <= 300:
+                for k in ("gs", "track", "vs"):
+                    if p.get(k) is None and prev.get(k) is not None:
+                        p[k] = prev[k]
+            prev = p
     return merged
 
 
@@ -711,6 +720,13 @@ def locate(reg, lookback=7):
         if pts and (fix is None or pts[-1]["t"] > fix["t"] + 5):
             p = pts[-1]
             fix = {"src": "adsb.lol trace", "t": p["t"], "lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "gs": p["gs"], "vs": p["vs"], "track": p.get("track"), "callsign": _last_callsign(pts), "hex": hx.upper(), "reg": (trace_meta or {}).get("r", "") or canon, "type": ""}
+            # position-only points carry no velocity; borrow speed/track/climb from the preceding few minutes
+            for q in reversed(pts[:-1]):
+                if p["t"] - q["t"] > 300:
+                    break
+                for k in ("gs", "track", "vs"):
+                    if fix[k] is None and q.get(k) is not None:
+                        fix[k] = q[k]
     # --- FlightAware record (when a server-side key is configured): authoritative departure/arrival events
     fa_flights = aeroapi_flights(canon, log)
     fa_last = next((f for f in (fa_flights or []) if f["off"]), None)
