@@ -432,17 +432,45 @@ def _is_ground_pt(p):
 
 
 def _departure_from_trace(pts):
-    """Last ground point before the final airborne run → departure airport of the current leg."""
+    """Departure airport of the current (final) airborne run. The last ground point only counts if the run starts
+    close to it in time and distance; otherwise the first airborne point must itself be low and next to an airport."""
     if not pts or _is_ground_pt(pts[-1]):
         return None
-    last_ground = None
-    for p in pts:
-        if _is_ground_pt(p):
-            last_ground = p
-    if not last_ground:
+    i = len(pts) - 1
+    while i > 0 and not _is_ground_pt(pts[i - 1]):
+        i -= 1
+    first_air = pts[i]
+    last_ground = pts[i - 1] if i > 0 and _is_ground_pt(pts[i - 1]) else None
+    if last_ground and (first_air["t"] - last_ground["t"]) <= 45 * 60 and hav(first_air["lat"], first_air["lon"], last_ground["lat"], last_ground["lon"]) <= 60:
+        n = nearest(last_ground["lat"], last_ground["lon"], 1)
+        if n and n[0]["dist"] <= n[0]["radius"] + 3:
+            return n[0]
+    n = nearest(first_air["lat"], first_air["lon"], 1)
+    if n and n[0]["dist"] <= 15 and isinstance(first_air["alt"], (int, float)) and first_air["alt"] - (n[0].get("elev") or 0) <= 5000:
+        return n[0]
+    return None
+
+
+def _landing_inferred(fix, n0, age):
+    """Last position was on final approach and nothing followed: the aircraft landed there.
+    Low above the field, slow, close, not climbing, pointed at the airport (or over it), silent for 10+ minutes."""
+    if not n0 or age < 600:
         return None
-    n = nearest(last_ground["lat"], last_ground["lon"], 1)
-    return n[0] if n else None
+    alt = fix["alt"]
+    elev = n0.get("elev") or 0
+    agl = (alt - elev) if isinstance(alt, (int, float)) else (0 if alt == "ground" else None)
+    if agl is None or agl > 2500:
+        return None
+    if fix["gs"] is not None and fix["gs"] > 200:
+        return None
+    if fix["vs"] is not None and fix["vs"] > 300:
+        return None
+    if n0["dist"] > 10:
+        return None
+    trk = fix.get("track")
+    if n0["dist"] > 5 and trk is not None and _ang_diff(trk, _bearing(fix["lat"], fix["lon"], n0["lat"], n0["lon"])) > 45:
+        return None
+    return "last fix %s at %d ft above the field, %s kt, %.1f nm from %s, %s; no transmission since - landed" % (_fmt_z(fix["t"]), agl, ("%d" % fix["gs"]) if fix["gs"] is not None else "?", n0["dist"] / 1.852, n0["iata"] or n0["code"], "descending" if (fix["vs"] or 0) < -100 else "level")
 
 
 def _last_callsign(pts):
@@ -563,6 +591,11 @@ def locate(reg, lookback=7):
     elev = n0["elev"] if n0 and n0.get("elev") is not None else 0
     alt = fix["alt"]
     on_ground = alt == "ground" or (isinstance(alt, (int, float)) and (fix["gs"] is None or fix["gs"] <= 60) and (alt - elev) <= 1500 and (fix["vs"] is None or abs(fix["vs"]) < 300))
+    landing_note = None
+    if not on_ground and not fresh and n0:
+        landing_note = _landing_inferred(fix, n0, age)
+        if landing_note:
+            on_ground = True
     out["fix"] = {"lat": round(fix["lat"], 5), "lon": round(fix["lon"], 5), "time_utc": datetime.fromtimestamp(fix["t"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "age_s": int(age), "source": fix["src"], "altitude": alt, "ground_speed_kt": fix["gs"], "callsign": fix["callsign"], "live_sources": [f["src"] for f in fixes]}
     # --- check: live sources agree
     fresh_fixes = [f for f in fixes if (now - f["t"]) <= FRESH_S]
@@ -581,9 +614,13 @@ def locate(reg, lookback=7):
         out["airport"] = {"iata": a["iata"], "icao": a["code"], "name": a["name"], "country": country_name(a["country"]), "distance_km": round(a["dist"], 1)}
         inside = a["dist"] <= a["radius"]
         others = [x for x in near[1:] if x["dist"] <= x["radius"] and SIZE_RANK.get(x["size"], 0) >= SIZE_RANK.get(a["size"], 0)]
+        if landing_note:
+            inside = True
         check("Inside airport boundary", inside and not others, ("%.1f nm from %s, outside its boundary" % (a["dist"] / 1.852, a["iata"] or a["code"])) if not inside else ("also inside %s - ambiguous" % (others[0]["iata"] or others[0]["code"])) if others else "%.1f nm from %s reference, within %.1f nm" % (a["dist"] / 1.852, a["iata"] or a["code"], a["radius"] / 1.852))
-        check("On-ground state", alt == "ground" or (isinstance(alt, (int, float)) and alt - elev <= 1500 and (fix["gs"] is None or fix["gs"] <= 60)), "ground flag set by transponder" if alt == "ground" else "%s ft, %s kt" % (alt, fix["gs"]))
+        check("On-ground state", landing_note is not None or alt == "ground" or (isinstance(alt, (int, float)) and alt - elev <= 1500 and (fix["gs"] is None or fix["gs"] <= 60)), "ground flag set by transponder" if alt == "ground" else ("landing inferred from final approach" if landing_note else "%s ft, %s kt" % (alt, fix["gs"])))
         corr, why = "", "single fix with nothing to corroborate it"
+        if landing_note:
+            corr = "Landing inferred: " + landing_note
         ground_fresh = [f for f in fresh_fixes if f["alt"] == "ground" or (isinstance(f["alt"], (int, float)) and f["alt"] - elev <= 1500)]
         if len(ground_fresh) > 1 and agree:
             corr = "%d independent live sources" % len(ground_fresh)
@@ -610,6 +647,8 @@ def locate(reg, lookback=7):
         line = airport_line(a) if inside else "%s (nearest airport, %.0f nm away, position is off-airport)" % (airport_line(a), a["dist"] / 1.852)
         if not fresh:
             out["since_utc"] = out["fix"]["time_utc"]
+        if landing_note:
+            out["landing_inferred"] = True
     else:
         cs = fix["callsign"] or _last_callsign(pts)
         route = route_for(cs, log) if cs else None
