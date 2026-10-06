@@ -123,7 +123,7 @@ function relayUrl(target) {
 }
 async function detectLocalRelay() {
   if (!/^https?:$/.test(location.protocol)) return false;
-  try { const j = await getJSON(location.origin + '/ping', {}, 3000); if (j && j.relay === 'local') { state.localRelay = location.origin + '/relay'; state.serverLocate = location.origin + '/locate'; state.flightaware = !!j.flightaware; return true; } } catch {}
+  try { const j = await getJSON(location.origin + '/ping', {}, 3000); if (j && j.relay === 'local') { state.localRelay = location.origin + '/relay'; state.serverLocate = location.origin + '/locate'; state.flightaware = !!j.flightaware; state.fr24Server = !!j.fr24; state.fr24ServerKey = !!j.fr24_server_key; return true; } } catch {}
   return false;
 }
 
@@ -726,7 +726,8 @@ function renderSimple(items) {
     <span class="badge-lg">${v.verified ? 'VERIFIED' : 'UNVERIFIED'}</span>
     <span class="reg">${esc(it.reg)}</span>
     <span class="status ${esc(v.cls)}">${esc(v.label)}</span>
-    <span class="meta">${esc(age)} · ${passed}/${total} checks passed · ${CONF_TEXT[v.conf].toLowerCase()}</span>
+    ${it.diverted ? `<span class="status diverted">DIVERTED${it.divertedFrom ? ' · filed ' + esc(it.divertedFrom) : ''}</span>` : ''}
+    <span class="meta">${esc(age)} · ${passed}/${total} checks passed · ${CONF_TEXT[v.conf].toLowerCase()}${it.provider ? ' · ' + esc(it.provider) : ''}</span>
   </div>
   <div class="line-row"><input class="line ${v.verified ? '' : 'none'}" id="line-${i}" readonly value="${esc(text)}" aria-label="Location line for ${esc(it.reg)}"><button class="btn copy" type="button" data-copy="${i}">Copy</button></div>
   ${guess}
@@ -766,8 +767,10 @@ fillAircraftLocation('EI-DEI');
 const STATUS_LABEL = { ground: 'On ground', ground_off_airport: 'On ground · off-airport', enroute: 'In flight', enroute_stale: 'Last seen in flight', unknown: 'No position data' };
 const STATUS_CLS = { ground: 'ground', ground_off_airport: 'stale', enroute: 'air', enroute_stale: 'stale', unknown: 'none' };
 async function serverLocate(regs) {
-  const j = await getJSON(`${state.serverLocate}?reg=${encodeURIComponent(regs.join(','))}&days=${settings.lookback}`, {}, 180000);
-  return (j.results || []).map(r => ({ reg: r.reg, line: r.text, live: r.fix && typeof r.fix.age_s === 'number' ? { lat: r.fix.lat, t: Date.now() - r.fix.age_s * 1000, src: r.fix.source } : null,
+  // the Flightradar24 token from Settings rides along so the server engine can use it when it has no key of its own
+  const hdr = settings.fr24Key ? { headers: { 'X-FR24-Key': settings.fr24Key } } : {};
+  const j = await getJSON(`${state.serverLocate}?reg=${encodeURIComponent(regs.join(','))}&days=${settings.lookback}`, hdr, 180000);
+  return (j.results || []).map(r => ({ reg: r.reg, line: r.text, provider: r.provider || '', diverted: !!r.diverted, divertedFrom: r.diverted_from || '', live: r.fix && typeof r.fix.age_s === 'number' ? { lat: r.fix.lat, t: Date.now() - r.fix.age_s * 1000, src: r.fix.source } : null,
     verdict: { verified: !!r.verified, checks: r.checks || [], cls: STATUS_CLS[r.status] || 'none', label: STATUS_LABEL[r.status] + (r.since_utc ? ' · since ' + fmtTime(Date.parse(r.since_utc)) : ''), conf: r.confidence === 'high' ? 'high' : r.confidence === 'medium' ? 'med' : 'low', mode: r.status.startsWith('ground') ? 'ground' : r.status.startsWith('enroute') ? 'air' : 'none', via: r.fix ? r.fix.source : '', whyNot: '' },
     best: r.best_guess, log: r.log || [] }));
 }
@@ -859,7 +862,7 @@ async function locate(text, { fromUser = true } = {}) {
     // 6) decide + render
     const serverItems = serverP ? await serverP : null;
     if (token !== runToken) return;
-    if (serverItems && serverItems.length) logAll('Lookup line taken from the server engine (/locate), which also consults FlightAware when a key is configured');
+    if (serverItems && serverItems.length) logAll('Lookup line taken from the server engine (/locate), which uses Flightradar24 as the primary source when a key is configured (FlightAware as fallback)');
     results.innerHTML = items.map((it, i) => { it.verdict = decide(it); verify(it, it.verdict); it.line = formatLine(it, it.verdict); return render(it, it.verdict, i); }).join('');
     items.forEach((it, i) => drawMap(i, it, it.verdict));
     if (serverItems && serverItems.length) { renderSimple(serverItems); postResults(serverItems); }
@@ -896,11 +899,13 @@ export default {
 function refreshSettingsUI() {
   const hasKey = !!settings.fr24Key, hasCloud = !!settings.cloudRelay, local = !!state.localRelay;
   const dotRelay = $('dotRelay'); dotRelay.className = 'dot ' + (local || hasCloud ? 'on' : 'off'); dotRelay.textContent = local ? 'Local relay' : hasCloud ? 'Cloud relay' : 'No relay';
-  $('dotFr24').className = 'dot ' + (hasKey ? 'on' : 'off'); $('dotFr24').textContent = hasKey ? (settings.sandbox ? 'FR24 sandbox' : 'FR24') : 'FR24 off';
+  const fr24On = hasKey || !!state.fr24Server;
+  $('dotFr24').className = 'dot ' + (fr24On ? 'on' : 'off'); $('dotFr24').textContent = fr24On ? (state.fr24ServerKey ? 'FR24 (server key)' : settings.sandbox ? 'FR24 sandbox' : 'FR24') : 'FR24 off';
+  const fs = $('fr24ServerState'); if (fs) fs.textContent = state.fr24ServerKey ? 'The server has its own Flightradar24 key (FR24_KEY) — every lookup already uses Flightradar24 as the primary source. A key entered below is only needed for the Full-detail view in this browser.' : state.localRelay ? 'The server has no Flightradar24 key. A token entered below is stored in this browser and sent with each lookup, so the server engine uses it too. To make it permanent for everyone, set FR24_KEY in the server environment (Render → Environment) or put it in a file named fr24.key next to tail_locator.py.' : 'Start the server (tail_locator.py) or open the hosted page; the token below is then sent with each lookup.';
   const fa = $('dotFA'); if (fa) { fa.className = 'dot ' + (state.flightaware ? 'on' : 'off'); fa.textContent = state.flightaware ? 'FlightAware' : 'FlightAware off'; }
   $('fr24Badge').hidden = !hasKey; $('relayBadge').hidden = !(local || hasCloud); $('relayBadge').textContent = local ? 'local relay connected' : 'cloud relay set';
   $('localState').textContent = local ? `Connected — this page is being served by tail_locator.py at ${location.origin}.` : (/^https?:$/.test(location.protocol) ? 'Not detected. Start tail_locator.py and open the address it prints (http://127.0.0.1:8765/).' : 'Not detected. You opened the HTML file directly; start tail_locator.py and use the address it prints instead, or set a cloud relay below.');
-  $('settingsSummary').textContent = `${local ? 'local relay' : hasCloud ? 'cloud relay' : 'no relay'} · ${settings.lookback}-day history · FR24 ${hasKey ? 'on' : 'off (optional)'}`;
+  $('settingsSummary').textContent = `${local ? 'local relay' : hasCloud ? 'cloud relay' : 'no relay'} · ${settings.lookback}-day history · Flightradar24 ${fr24On ? (state.fr24ServerKey ? 'on (server key)' : 'on') : 'off — free data only'}`;
   $('hintText').textContent = local || hasCloud ? 'Up to 15 registrations per lookup. Press Enter or wait for auto-locate.' : 'No relay yet: run tail_locator.py (free) and open the address it prints. Identity lookups still work without it.';
 }
 function initSettings() {
